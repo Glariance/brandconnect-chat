@@ -37,7 +37,9 @@ Reviewed baseline: `fc2fd7428f716b7c10eb4a6782fa5bc629d16254`.
 
 ## First functional milestone
 
-Keep the frontend at the repository root and create Laravel in `backend/`; moving the frontend now adds unnecessary churn.
+Keep the frontend at the repository root and use the existing Laravel project in `api/`; do not create `backend/` or scaffold a second Laravel project. Moving the frontend now adds unnecessary churn.
+
+Update after the baseline audit: `main` now contains `api/artisan`, `api/composer.json` and `api/composer.lock`. The composer manifest requests PHP ^8.3 and Laravel ^13.17. The developer reports PHP 8.3.30, Composer 2.9.5 and MySQL 8.4.3 locally. These local runtime checks are developer-reported, not independently executed here. The original implementation findings above describe the reviewed frontend baseline.
 
 Deliver agent login + authenticated brands + persistent anonymous visitor chat + agent replies + authorized Reverb events. Verify with two different browser sessions before advanced lead capture.
 
