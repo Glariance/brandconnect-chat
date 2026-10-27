@@ -1,17 +1,17 @@
 # Cursor task: first real Laravel chat
 
-Paste the following task into Cursor Agent with this repository open. Work on a new feature branch after the preparation PR is merged, or branch from it. Read AGENTS.md first.
+Use this task in Cursor Agent with this repository open. Continue on the existing feature/laravel-chat branch. Read root AGENTS.md and api/AGENTS.md before modifying code. These docs live on codex/laravel-preparation until merged; they can also be restored explicitly from that remote branch without switching branches.
 
 ## Objective
 
 Replace the browser-local chat prototype with real persistent chat between separate browsers. Preserve the current visual design and TanStack Start routes. Do not rebuild the dashboard or change the frontend framework.
 
-Inspect PHP, Composer, Node and MySQL versions locally. Choose a supported Laravel release compatible with the installed PHP runtime, report versions and commit composer.lock. If a requirement is missing, explain the concrete prerequisite rather than generating a fake backend.
+The developer has already checked PHP 8.3.30, Composer 2.9.5 and MySQL 8.4.3. The existing api/composer.json requests PHP ^8.3 and Laravel ^13.17. Inspect api/composer.lock and run php artisan --version to determine the installed framework version; preserve the existing project and lockfile. Check Node compatibility with the frontend lockfile. MySQL CLI is not on PATH; use D:/laragon/bin/mysql/mysql-8.4.3-winx64/bin/mysql.exe when needed. Keep database credentials in local environment files. Do not upgrade/recreate Laravel merely to follow an older scaffold instruction.
 
 ## Architecture
 
 - Keep existing frontend at repository root.
-- Add the Laravel project under backend/.
+- Use the existing Laravel project under api/. Do not create backend/ or another Laravel installation.
 - MySQL for persistent records.
 - Laravel Sanctum cookie authentication for the dashboard.
 - Self-hosted Laravel Reverb and Echo for realtime events.
@@ -22,7 +22,7 @@ Inspect PHP, Composer, Node and MySQL versions locally. Choose a supported Larav
 
 ## Implement in order
 
-1. Scaffold Laravel in backend/, protect secrets and generated files, and add environment examples.
+1. Inspect and extend the existing Laravel scaffold in api/. Run Composer commands inside api/, protect secrets and generated files, and add environment examples without overwriting local credentials. Verify root and api/.gitignore cover vendor, environment files, keys, logs, caches and development databases.
 2. Add organizations, users/memberships, brands, brand-agent access, visitors, conversations, messages and visitor sessions. Store timestamps in UTC.
 3. Build an idempotent interactive owner-provisioning command. Prompt securely for a password; do not commit a universal default password. Provision a development brand separately.
 4. Implement login, current-user and logout. Add a login page, a protected dashboard boundary, real current-user display and logout. Keep /widget and /widget-demo public. Preserve the root Outlet.
