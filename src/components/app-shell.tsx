@@ -1,10 +1,13 @@
-import { Link } from "@tanstack/react-router";
-import { useState, type ReactNode } from "react";
+import { Link, useNavigate } from "@tanstack/react-router";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   LayoutDashboard, Inbox, Radar, Users, Building2, UserCog, Workflow, MessageSquareText,
   BarChart3, Plug, ScrollText, Settings, Menu, X, ChevronDown, Search, Bell, MessagesSquare,
 } from "lucide-react";
-import { brands } from "@/lib/sample-data";
+import { brands as sampleBrands } from "@/lib/sample-data";
+import { useAuth } from "@/lib/auth";
+import { ApiError, isRealChatEnabled } from "@/lib/api";
+import { fetchBrands, type ApiBrand } from "@/lib/chat-api";
 
 export const nav = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
@@ -24,6 +27,38 @@ export const nav = [
 export function AppShell({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const [brand, setBrand] = useState("all");
+  const [apiBrands, setApiBrands] = useState<ApiBrand[]>([]);
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+  const real = isRealChatEnabled();
+
+  useEffect(() => {
+    if (!real) return;
+    void fetchBrands()
+      .then(setApiBrands)
+      .catch((e) => {
+        if (!(e instanceof ApiError && e.status === 401)) {
+          console.warn("Could not load brands", e);
+        }
+      });
+  }, [real]);
+
+  const brandOptions = real && apiBrands.length > 0
+    ? apiBrands.map((b) => ({ id: String(b.id), name: b.name }))
+    : sampleBrands.map((b) => ({ id: b.id, name: b.name }));
+
+  const initials = (user?.name ?? "?")
+    .split(/\s+/)
+    .map((p) => p[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+
+  const onLogout = async () => {
+    await logout();
+    await navigate({ to: "/login" });
+  };
+
   return (
     <div className="flex min-h-screen bg-background">
       <aside
@@ -56,6 +91,11 @@ export function AppShell({ children }: { children: ReactNode }) {
       </aside>
       {open && <div className="fixed inset-0 z-30 bg-foreground/40 lg:hidden" onClick={() => setOpen(false)} />}
       <div className="flex min-w-0 flex-1 flex-col">
+        <div className="border-b bg-warning/15 px-4 py-2 text-xs text-foreground" role="status">
+          {real
+            ? "Prototype notice: Inbox and widget chat use the Laravel API when configured. Other dashboard pages remain demo placeholders."
+            : "Prototype notice: demo sample data only. Set VITE_REAL_CHAT=true and VITE_API_URL to enable persistent chat."}
+        </div>
         <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b bg-card px-4">
           <button className="lg:hidden" onClick={() => setOpen(true)} aria-label="Open menu">
             <Menu className="size-5" />
@@ -68,7 +108,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               className="h-9 appearance-none rounded-md border bg-background pl-3 pr-8 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <option value="all">All brands</option>
-              {brands.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+              {brandOptions.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
             </select>
             <ChevronDown className="pointer-events-none absolute right-2 top-2.5 size-4 text-muted-foreground" />
           </label>
@@ -78,12 +118,14 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
           <button className="relative rounded-md p-2 hover:bg-muted md:ml-0 ml-auto" aria-label="Notifications">
             <Bell className="size-5" />
-            <span className="absolute right-1.5 top-1.5 size-2 rounded-full bg-destructive" />
           </button>
           <div className="flex items-center gap-2">
-            <div className="flex size-8 items-center justify-center rounded-full bg-accent text-xs font-semibold text-accent-foreground">AK</div>
-            <span className="hidden text-sm sm:inline">Ayesha K.</span>
+            <div className="flex size-8 items-center justify-center rounded-full bg-accent text-xs font-semibold text-accent-foreground">{initials}</div>
+            <span className="hidden text-sm sm:inline">{user?.name ?? "Agent"}</span>
             <span className="size-2 rounded-full bg-success" title="Online" />
+            <button type="button" onClick={() => void onLogout()} className="text-xs text-muted-foreground underline hover:text-foreground">
+              Log out
+            </button>
           </div>
         </header>
         <main className="flex-1 p-4 md:p-6">{children}</main>

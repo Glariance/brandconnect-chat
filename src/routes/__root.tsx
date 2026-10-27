@@ -7,6 +7,7 @@ import {
   useRouterState,
   HeadContent,
   Scripts,
+  Navigate,
   type ErrorComponentProps,
 } from "@tanstack/react-router";
 import { useEffect, type ReactNode } from "react";
@@ -14,6 +15,7 @@ import { useEffect, type ReactNode } from "react";
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
 import { AppShell } from "@/components/app-shell";
+import { AuthProvider, useAuth } from "@/lib/auth";
 
 function NotFoundComponent() {
   return (
@@ -121,16 +123,33 @@ function RootShell({ children }: { children: ReactNode }) {
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const bare = pathname.startsWith("/widget");
+  const bare = pathname.startsWith("/widget") || pathname === "/login";
 
   return (
     <QueryClientProvider client={queryClient}>
-      {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
-      {bare ? <Outlet /> : (
-        <AppShell>
-          <Outlet />
-        </AppShell>
-      )}
+      <AuthProvider>
+        {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
+        {bare ? <Outlet /> : (
+          <ProtectedShell>
+            <Outlet />
+          </ProtectedShell>
+        )}
+      </AuthProvider>
     </QueryClientProvider>
   );
+}
+
+function ProtectedShell({ children }: { children: ReactNode }) {
+  const { user, loading } = useAuth();
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-sm text-muted-foreground">
+        Checking session…
+      </div>
+    );
+  }
+  if (!user) {
+    return <Navigate to="/login" />;
+  }
+  return <AppShell>{children}</AppShell>;
 }

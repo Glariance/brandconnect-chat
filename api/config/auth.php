@@ -42,6 +42,11 @@ return [
             'driver' => 'session',
             'provider' => 'users',
         ],
+
+        // Anonymous widget visitors: hashed bearer token lookup (see AppServiceProvider).
+        'visitor' => [
+            'driver' => 'visitor-token',
+        ],
     ],
 
     /*

@@ -17,6 +17,7 @@ import { Route as CannedRepliesRouteImport } from './routes/canned-replies'
 import { Route as ContactsRouteImport } from './routes/contacts'
 import { Route as InboxRouteImport } from './routes/inbox'
 import { Route as IntegrationsRouteImport } from './routes/integrations'
+import { Route as LoginRouteImport } from './routes/login'
 import { Route as ReportsRouteImport } from './routes/reports'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as TeamRouteImport } from './routes/team'
@@ -64,6 +65,11 @@ const IntegrationsRoute = IntegrationsRouteImport.update({
   path: '/integrations',
   getParentRoute: () => rootRouteImport,
 } as any)
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ReportsRoute = ReportsRouteImport.update({
   id: '/reports',
   path: '/reports',
@@ -104,6 +110,7 @@ export interface FileRoutesByFullPath {
   '/contacts': typeof ContactsRoute
   '/inbox': typeof InboxRoute
   '/integrations': typeof IntegrationsRoute
+  '/login': typeof LoginRoute
   '/reports': typeof ReportsRoute
   '/settings': typeof SettingsRoute
   '/team': typeof TeamRoute
@@ -120,6 +127,7 @@ export interface FileRoutesByTo {
   '/contacts': typeof ContactsRoute
   '/inbox': typeof InboxRoute
   '/integrations': typeof IntegrationsRoute
+  '/login': typeof LoginRoute
   '/reports': typeof ReportsRoute
   '/settings': typeof SettingsRoute
   '/team': typeof TeamRoute
@@ -137,6 +145,7 @@ export interface FileRoutesById {
   '/contacts': typeof ContactsRoute
   '/inbox': typeof InboxRoute
   '/integrations': typeof IntegrationsRoute
+  '/login': typeof LoginRoute
   '/reports': typeof ReportsRoute
   '/settings': typeof SettingsRoute
   '/team': typeof TeamRoute
@@ -155,6 +164,7 @@ export interface FileRouteTypes {
     | '/contacts'
     | '/inbox'
     | '/integrations'
+    | '/login'
     | '/reports'
     | '/settings'
     | '/team'
@@ -171,6 +181,7 @@ export interface FileRouteTypes {
     | '/contacts'
     | '/inbox'
     | '/integrations'
+    | '/login'
     | '/reports'
     | '/settings'
     | '/team'
@@ -187,6 +198,7 @@ export interface FileRouteTypes {
     | '/contacts'
     | '/inbox'
     | '/integrations'
+    | '/login'
     | '/reports'
     | '/settings'
     | '/team'
@@ -204,6 +216,7 @@ export interface RootRouteChildren {
   ContactsRoute: typeof ContactsRoute
   InboxRoute: typeof InboxRoute
   IntegrationsRoute: typeof IntegrationsRoute
+  LoginRoute: typeof LoginRoute
   ReportsRoute: typeof ReportsRoute
   SettingsRoute: typeof SettingsRoute
   TeamRoute: typeof TeamRoute
@@ -270,6 +283,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IntegrationsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/reports': {
       id: '/reports'
       path: '/reports'
@@ -324,6 +344,7 @@ const rootRouteChildren: RootRouteChildren = {
   ContactsRoute: ContactsRoute,
   InboxRoute: InboxRoute,
   IntegrationsRoute: IntegrationsRoute,
+  LoginRoute: LoginRoute,
   ReportsRoute: ReportsRoute,
   SettingsRoute: SettingsRoute,
   TeamRoute: TeamRoute,
