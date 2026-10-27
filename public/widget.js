@@ -25,7 +25,7 @@
     btn.setAttribute("aria-label", open ? "Close chat" : "Open chat");
   };
   window.addEventListener("message", function (e) {
-    if (e.origin === origin && e.data === "bc:close" && open) btn.onclick();
+    if (e.origin === origin && e.source === frame.contentWindow && e.data === "bc:close" && open) btn.onclick();
   });
   document.body.appendChild(frame);
   document.body.appendChild(btn);

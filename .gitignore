@@ -33,3 +33,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Laravel backend
+/backend/vendor/
+/backend/storage/*.key
+/backend/storage/logs/*
+/backend/bootstrap/cache/*.php
+/backend/database/*.sqlite*
