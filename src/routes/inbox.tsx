@@ -1,10 +1,10 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Send, Paperclip, Smile, Bot, Radio } from "lucide-react";
 import { Card, Badge, Btn } from "@/components/app-shell";
 import { conversations, messages } from "@/lib/sample-data";
 import { addMessage, closeConv, markRead, now, useLiveChats } from "@/lib/chat-store";
-import { ApiError, isRealChatEnabled } from "@/lib/api";
+import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
 import {
   fetchAgentMessages,
   fetchConversations,
@@ -16,6 +16,14 @@ import {
   type ApiConversation,
   type ApiMessage,
 } from "@/lib/chat-api";
+import {
+  createAgentEcho,
+  disconnectEcho,
+  subscribeToConversation,
+  type ConversationSubscription,
+  type EchoLike,
+} from "@/lib/echo-client";
+import { latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
 
 export const Route = createFileRoute("/inbox")({
   head: () => ({
@@ -87,21 +95,75 @@ function RealInbox() {
   const [active, setActive] = useState<string | null>(null);
   const [rows, setRows] = useState<ApiConversation[]>([]);
   const [msgs, setMsgs] = useState<ApiMessage[]>([]);
+  const [olderCursor, setOlderCursor] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [pendingTick, setPendingTick] = useState(0);
+
+  const pendingRef = useRef(new PendingSendRegistry());
+  const activeRef = useRef<string | null>(null);
+  const msgsRef = useRef<ApiMessage[]>([]);
+  const listAbortRef = useRef<AbortController | null>(null);
+  const msgsAbortRef = useRef<AbortController | null>(null);
+  const echoRef = useRef<EchoLike | null>(null);
+  const subRef = useRef<ConversationSubscription | null>(null);
+  const convGenRef = useRef(0);
+
+  activeRef.current = active;
+  msgsRef.current = msgs;
+
+  const bumpPending = () => setPendingTick((n) => n + 1);
+
+  const applyIncoming = useCallback((conversationId: string, incoming: ApiMessage[]) => {
+    if (activeRef.current !== conversationId) return;
+    setMsgs((prev) => {
+      const merged = mergeMessages(prev, incoming);
+      for (const m of incoming) {
+        if (m.client_message_id) pendingRef.current.confirm(conversationId, m.client_message_id);
+      }
+      return merged;
+    });
+    bumpPending();
+  }, []);
+
+  const catchUpAfter = useCallback(async (conversationId: string, afterId?: number) => {
+    const gen = convGenRef.current;
+    try {
+      const page = await fetchAgentMessages(conversationId, afterId ? { after_id: afterId } : {});
+      if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+      if (afterId) applyIncoming(conversationId, page.data);
+      else {
+        setMsgs(page.data);
+        setOlderCursor(page.nextCursor);
+        for (const m of page.data) {
+          if (m.client_message_id) pendingRef.current.confirm(conversationId, m.client_message_id);
+        }
+        bumpPending();
+      }
+      const readId = latestServerId(page.data.length ? page.data : msgsRef.current);
+      if (readId) {
+        try { await markConversationRead(conversationId, readId); } catch { /* ignore */ }
+      }
+    } catch (e) {
+      if (isAbortError(e) || gen !== convGenRef.current) return;
+      setError(e instanceof ApiError ? e.message : "Failed to sync messages");
+    }
+  }, [applyIncoming]);
 
   const loadList = useCallback(async () => {
+    listAbortRef.current?.abort();
+    const ac = new AbortController();
+    listAbortRef.current = ac;
     try {
       setError(null);
-      const list = await fetchConversations({ status: tab });
+      const list = await fetchConversations({ status: tab }, { signal: ac.signal });
       setRows(list);
-      setActive((prev) => {
-        if (prev && list.some((c) => c.id === prev)) return prev;
-        return list[0]?.id ?? null;
-      });
+      setActive((prev) => (prev && list.some((c) => c.id === prev) ? prev : list[0]?.id ?? null));
     } catch (e) {
+      if (isAbortError(e)) return;
       setError(e instanceof ApiError ? e.message : "Failed to load conversations");
       setRows([]);
     } finally {
@@ -112,29 +174,110 @@ function RealInbox() {
   useEffect(() => {
     setLoading(true);
     void loadList();
+    // Keep inbox-list polling until new-conversation notifications exist.
     const t = window.setInterval(() => void loadList(), 5000);
-    return () => window.clearInterval(t);
+    return () => {
+      window.clearInterval(t);
+      listAbortRef.current?.abort();
+    };
   }, [loadList]);
 
-  const loadMessages = useCallback(async (id: string) => {
-    try {
-      const list = await fetchAgentMessages(id);
-      setMsgs(list);
-      const last = list.at(-1);
-      if (last) {
-        try { await markConversationRead(id, last.id); } catch { /* ignore */ }
+  useEffect(() => {
+    let cancelled = false;
+    void createAgentEcho().then((echo) => {
+      if (cancelled) {
+        disconnectEcho(echo);
+        return;
       }
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load messages");
-    }
+      echoRef.current = echo;
+    });
+    return () => {
+      cancelled = true;
+      subRef.current?.leave();
+      subRef.current = null;
+      disconnectEcho(echoRef.current);
+      echoRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
-    if (!active) { setMsgs([]); return; }
-    void loadMessages(active);
-    const t = window.setInterval(() => void loadMessages(active), 3000);
-    return () => window.clearInterval(t);
-  }, [active, loadMessages]);
+    msgsAbortRef.current?.abort();
+    subRef.current?.leave();
+    subRef.current = null;
+
+    setMsgs([]);
+    setOlderCursor(null);
+    setDraft("");
+    if (active) pendingRef.current.clearConversation(active);
+    bumpPending();
+
+    if (!active) return;
+
+    convGenRef.current += 1;
+    const gen = convGenRef.current;
+    const conversationId = active;
+    const ac = new AbortController();
+    msgsAbortRef.current = ac;
+
+    void (async () => {
+      try {
+        const page = await fetchAgentMessages(conversationId, {}, { signal: ac.signal });
+        if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+        setMsgs(page.data);
+        setOlderCursor(page.nextCursor);
+        const readId = latestServerId(page.data);
+        if (readId) {
+          try { await markConversationRead(conversationId, readId, { signal: ac.signal }); } catch { /* ignore */ }
+        }
+      } catch (e) {
+        if (isAbortError(e) || gen !== convGenRef.current) return;
+        setError(e instanceof ApiError ? e.message : "Failed to load messages");
+      }
+    })();
+
+    const trySubscribe = () => {
+      const echo = echoRef.current;
+      if (!echo || activeRef.current !== conversationId) return;
+      subRef.current?.leave();
+      subRef.current = subscribeToConversation(
+        echo,
+        conversationId,
+        (msg) => applyIncoming(conversationId, [msg]),
+        () => void catchUpAfter(conversationId, latestServerId(msgsRef.current)),
+      );
+    };
+    trySubscribe();
+    const wait = window.setInterval(() => {
+      if (echoRef.current) {
+        trySubscribe();
+        window.clearInterval(wait);
+      }
+    }, 200);
+
+    return () => {
+      window.clearInterval(wait);
+      ac.abort();
+      subRef.current?.leave();
+      subRef.current = null;
+    };
+  }, [active, applyIncoming, catchUpAfter]);
+
+  const loadOlder = async () => {
+    if (!active || !olderCursor || loadingOlder) return;
+    setLoadingOlder(true);
+    const conversationId = active;
+    const gen = convGenRef.current;
+    try {
+      const page = await fetchAgentMessages(conversationId, { cursor: olderCursor });
+      if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+      setMsgs((prev) => mergeMessages(page.data, prev));
+      setOlderCursor(page.nextCursor);
+    } catch (e) {
+      if (!isAbortError(e)) setError(e instanceof ApiError ? e.message : "Could not load older messages");
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
 
   const mapped: Row[] = rows.map((c) => ({
     id: c.id,
@@ -152,23 +295,44 @@ function RealInbox() {
     id: "", name: "No conversation", brand: "—", last: "", time: "", unread: 0, status: tab, sub: "", live: false,
   };
   const apiConv = rows.find((c) => c.id === conv.id);
+  void pendingTick;
+  const pendingForActive = conv.id ? pendingRef.current.listFor(conv.id) : [];
 
   const send = async () => {
     if (!draft.trim() || !conv.id || sending) return;
+    const conversationId = conv.id;
+    const text = draft.trim();
+    const pending = pendingRef.current.ensure(conversationId, text, "agent", newClientMessageId);
+    bumpPending();
     setSending(true);
     setError(null);
-    const text = draft.trim();
-    const clientId = newClientMessageId();
+    setDraft("");
     try {
-      const msg = await postAgentMessage(conv.id, clientId, text);
-      setMsgs((prev) => (prev.some((m) => m.id === msg.id || m.client_message_id === clientId) ? prev : [...prev, msg]));
-      setDraft("");
+      const msg = await postAgentMessage(conversationId, pending.clientMessageId, text);
+      if (activeRef.current === conversationId) {
+        pendingRef.current.confirm(conversationId, pending.clientMessageId);
+        setMsgs((prev) => mergeMessages(prev, [msg]));
+        bumpPending();
+      }
       await loadList();
     } catch (e) {
+      if (isAbortError(e)) return;
+      pendingRef.current.markFailed(conversationId, pending.clientMessageId);
+      bumpPending();
+      setDraft(text);
       setError(e instanceof ApiError ? e.message : "Send failed");
     } finally {
       setSending(false);
     }
+  };
+
+  const retryFailed = (clientMessageId: string) => {
+    if (!conv.id) return;
+    const pending = pendingRef.current.get(conv.id, clientMessageId);
+    if (!pending) return;
+    setDraft(pending.text);
+    pending.status = "pending";
+    bumpPending();
   };
 
   const onClose = async () => {
@@ -180,6 +344,23 @@ function RealInbox() {
       setError(e instanceof ApiError ? e.message : "Could not close chat");
     }
   };
+
+  const displayMsgs = [
+    ...msgs.map((m) => ({
+      key: `m-${m.id}`,
+      from: m.sender_type,
+      text: m.body,
+      time: formatMsgTime(m.created_at),
+    })),
+    ...pendingForActive.map((p) => ({
+      key: `p-${p.clientMessageId}`,
+      from: p.senderType,
+      text: p.text,
+      time: p.status === "failed" ? "failed" : "sending…",
+      failed: p.status === "failed",
+      onRetry: p.status === "failed" ? () => retryFailed(p.clientMessageId) : undefined,
+    })),
+  ];
 
   return (
     <>
@@ -198,16 +379,13 @@ function RealInbox() {
           shown={shown}
           conv={conv}
           setActive={setActive}
-          msgs={msgs.map((m) => ({
-            key: String(m.id),
-            from: m.sender_type,
-            text: m.body,
-            time: formatMsgTime(m.created_at),
-          }))}
+          msgs={displayMsgs}
           draft={draft}
           setDraft={setDraft}
           onSend={() => void send()}
           onClose={() => void onClose()}
+          onLoadOlder={olderCursor ? () => void loadOlder() : undefined}
+          loadingOlder={loadingOlder}
           sideDetails={apiConv
             ? [["Source", "Chat widget"], ["Current page", apiConv.page ?? "/"], ["Brand", apiConv.brand?.name ?? String(apiConv.brand_id)], ["Messages", String(msgs.length)]]
             : [["Source", "—"]]}
@@ -218,19 +396,21 @@ function RealInbox() {
 }
 
 function InboxLayout({
-  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails,
+  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails, onLoadOlder, loadingOlder,
 }: {
   tab: "open" | "pending" | "closed";
   setTab: (t: "open" | "pending" | "closed") => void;
   shown: Row[];
   conv: Row;
   setActive: (id: string) => void;
-  msgs: { key: string; from: string; text: string; time: string }[];
+  msgs: { key: string; from: string; text: string; time: string; failed?: boolean; onRetry?: () => void }[];
   draft: string;
   setDraft: (v: string) => void;
   onSend: () => void;
   onClose: () => void;
   sideDetails: string[][];
+  onLoadOlder?: () => void;
+  loadingOlder?: boolean;
 }) {
   return (
     <div className="grid h-[calc(100vh-7.5rem)] gap-4 md:grid-cols-[300px_1fr] xl:grid-cols-[300px_1fr_260px]">
@@ -270,12 +450,27 @@ function InboxLayout({
           <Btn variant="outline" className="ml-auto" onClick={onClose}>Close chat</Btn>
         </div>
         <div className="flex-1 space-y-3 overflow-y-auto bg-muted/30 p-4" aria-live="polite">
+          {onLoadOlder && (
+            <div className="text-center">
+              <button type="button" className="text-xs text-primary underline" onClick={onLoadOlder} disabled={loadingOlder}>
+                {loadingOlder ? "Loading…" : "Load older messages"}
+              </button>
+            </div>
+          )}
           {msgs.map((m) => (
             <div key={m.key} className={`flex ${m.from === "agent" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[75%] rounded-2xl px-3.5 py-2 text-sm ${m.from === "agent" ? "bg-primary text-primary-foreground" : "bg-card border"}`}>
+              <div className={`max-w-[75%] rounded-2xl px-3.5 py-2 text-sm ${m.from === "agent" ? "bg-primary text-primary-foreground" : "bg-card border"} ${m.failed ? "opacity-80 ring-1 ring-destructive" : ""}`}>
                 {m.from === "bot" && <p className="mb-1 flex items-center gap-1 text-xs text-muted-foreground"><Bot className="size-3" /> Automated greeting</p>}
                 {m.text}
-                <p className={`mt-1 text-[10px] ${m.from === "agent" ? "text-primary-foreground/70" : "text-muted-foreground"}`}>{m.time}</p>
+                <p className={`mt-1 text-[10px] ${m.from === "agent" ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
+                  {m.time}
+                  {m.failed && m.onRetry && (
+                    <>
+                      {" · "}
+                      <button type="button" className="underline" onClick={m.onRetry}>Retry</button>
+                    </>
+                  )}
+                </p>
               </div>
             </div>
           ))}

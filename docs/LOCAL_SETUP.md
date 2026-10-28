@@ -13,10 +13,16 @@ Milestone 1 uses the existing Laravel app in `api/` and the TanStack frontend at
 
 Use the **same host style** everywhere (`localhost` *or* `127.0.0.1`). Mixing them breaks Sanctum cookies.
 
-## Realtime status
+## Realtime behavior (current)
 
-- **Polling: implemented.** Inbox and widget refresh messages over HTTP on a short interval. Persistent chat works without Reverb/Echo.
-- **Laravel Echo (browser client): pending.** API broadcasts (`MessageCreated`) and Reverb channel authorization are in place; the React app does not yet subscribe via Echo. Run Reverb + `queue:work` so broadcasts are processed when Echo is wired later.
+- **Conversation messages (agent + visitor):** Laravel Echo subscribes to `private-conversations.{id}` and listens for `.message.created` when `VITE_REVERB_APP_KEY` is set and Reverb is reachable. Echo is created **browser-only** (dynamic import) so TanStack SSR is unaffected.
+- **Auth:**
+  - Dashboard Echo auth uses Sanctum session cookies + `X-XSRF-TOKEN` against `/broadcasting/auth` (`credentials: include`).
+  - Widget Echo auth uses the visitor Bearer token against `/api/v1/widget/broadcasting/auth` with **cookies omitted**.
+- **Reconnect:** on websocket `connected`, the client HTTP-fetches messages with `after_id` and merges by server id (no duplicates).
+- **Inbox list:** still **HTTP-polled** (~5s) until a dedicated new-conversation notification channel exists.
+- **Fallback:** if Reverb/Echo is unavailable, message catch-up still works via HTTP (`after_id` / load-older cursors). Sending does not depend on Echo.
+- **Queue:** `MessageCreated` is queued — run `php artisan queue:work` or broadcasts will not leave the API.
 
 ## Prerequisites
 
@@ -63,7 +69,7 @@ REVERB_SERVER_HOST=0.0.0.0
 REVERB_SERVER_PORT=8081
 ```
 
-Generate Reverb credentials locally (do not commit real keys), for example with `php artisan reverb:install` / values already prompted into `.env`, or random app id/key/secret.
+Generate Reverb credentials locally (do not commit real keys).
 
 Then:
 
@@ -110,16 +116,20 @@ VITE_REVERB_PORT=8081
 VITE_REVERB_SCHEME=http
 ```
 
-`VITE_REVERB_*` is reserved for the pending Echo client; chat already works via polling when `VITE_API_URL` is set.
+## Visitor storage note
+
+The widget wraps `sessionStorage` in a safe adapter. If storage is blocked, credentials stay **in memory only** — persistence across reload cannot be guaranteed. Expired/revoked visitor tokens start a **new** anonymous session (no recovery of another visitor’s history).
 
 ## Manual verification
 
 1. Open `http://localhost:8080/login`, sign in with the owner you provisioned locally.
 2. Open Brands; copy the brand public id from the install snippet.
 3. Open `/widget-demo?brand=<public_id>` (or an incognito window).
-4. Send a visitor message; confirm it appears in `/inbox` (via polling).
+4. Send a visitor message; confirm it appears in `/inbox` (Echo when Reverb+queue are up; otherwise next HTTP sync).
 5. Reply as the agent; refresh both sides — messages should persist (API is source of truth).
 6. A second visitor session must not see the first conversation.
+
+Still explicitly pending until performed: two-browser exchange, second-origin embed with third-party storage blocked, and production `frame-ancestors` verification.
 
 ## Tests
 

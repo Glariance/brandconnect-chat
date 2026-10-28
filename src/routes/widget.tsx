@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { brands } from "@/lib/sample-data";
 import { addMessage, now, useLiveChats } from "@/lib/chat-store";
-import { ApiError, isRealChatEnabled } from "@/lib/api";
+import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
 import {
   createVisitorConversation,
   createVisitorSession,
@@ -15,6 +15,15 @@ import {
   type ApiMessage,
   type WidgetConfig,
 } from "@/lib/chat-api";
+import {
+  createVisitorEcho,
+  disconnectEcho,
+  subscribeToConversation,
+  type ConversationSubscription,
+  type EchoLike,
+} from "@/lib/echo-client";
+import { isVisitorAuthExpired, latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
+import { createSafeStorage, storagePersistenceNotice, type SafeStorage } from "@/lib/safe-storage";
 
 export const Route = createFileRoute("/widget")({
   validateSearch: (s: Record<string, unknown>) => ({ brand: String(s["brand"] ?? ""), page: String(s["page"] ?? "/") }),
@@ -91,15 +100,123 @@ function DemoWidget() {
 
 function RealWidget() {
   const { brand: publicId, page } = Route.useSearch();
+  const storageRef = useRef<SafeStorage | null>(null);
+  if (!storageRef.current && typeof window !== "undefined") {
+    storageRef.current = createSafeStorage();
+  }
+
   const [config, setConfig] = useState<WidgetConfig | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [msgs, setMsgs] = useState<ApiMessage[]>([]);
+  const [olderCursor, setOlderCursor] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [storageNotice, setStorageNotice] = useState<string | null>(null);
   const [booting, setBooting] = useState(true);
   const [sending, setSending] = useState(false);
+  const [pendingTick, setPendingTick] = useState(0);
   const end = useRef<HTMLDivElement>(null);
+
+  const pendingRef = useRef(new PendingSendRegistry());
+  const tokenRef = useRef<string | null>(null);
+  const convRef = useRef<string | null>(null);
+  const msgsRef = useRef<ApiMessage[]>([]);
+  const bootAbortRef = useRef<AbortController | null>(null);
+  const echoRef = useRef<EchoLike | null>(null);
+  const subRef = useRef<ConversationSubscription | null>(null);
+  const genRef = useRef(0);
+  const renewingRef = useRef(false);
+
+  tokenRef.current = token;
+  convRef.current = conversationId;
+  msgsRef.current = msgs;
+
+  const bumpPending = () => setPendingTick((n) => n + 1);
+
+  const clearVisitorIdentity = useCallback((pid: string) => {
+    const storage = storageRef.current;
+    storage?.removeItem(SESSION_KEY(pid));
+    storage?.removeItem(CONV_KEY(pid));
+  }, []);
+
+  const applyIncoming = useCallback((cid: string, incoming: ApiMessage[]) => {
+    if (convRef.current !== cid) return;
+    setMsgs((prev) => {
+      const merged = mergeMessages(prev, incoming);
+      for (const m of incoming) {
+        if (m.client_message_id) pendingRef.current.confirm(cid, m.client_message_id);
+      }
+      return merged;
+    });
+    bumpPending();
+  }, []);
+
+  const startAnonymousSession = useCallback(async (pid: string, pagePath: string, signal?: AbortSignal, forceNew = false) => {
+    const storage = storageRef.current ?? createSafeStorage();
+    storageRef.current = storage;
+    setStorageNotice(storagePersistenceNotice(storage.mode));
+
+    if (forceNew) clearVisitorIdentity(pid);
+
+    const cfg = await fetchWidgetConfig(pid, { signal });
+    setConfig(cfg);
+
+    let sessionToken = forceNew ? null : storage.getItem(SESSION_KEY(pid));
+    if (!sessionToken) {
+      const session = await createVisitorSession(pid, { signal });
+      sessionToken = session.token;
+      storage.setItem(SESSION_KEY(pid), sessionToken);
+    }
+    setToken(sessionToken);
+
+    let convId = forceNew ? null : storage.getItem(CONV_KEY(pid));
+    if (!convId) {
+      const conv = await createVisitorConversation(sessionToken, { page: pagePath }, { signal });
+      convId = conv.id;
+      storage.setItem(CONV_KEY(pid), convId);
+    }
+    setConversationId(convId);
+
+    const page = await fetchVisitorMessages(sessionToken, convId, {}, { signal });
+    setMsgs(page.data);
+    setOlderCursor(page.nextCursor);
+    return { token: sessionToken, conversationId: convId };
+  }, [clearVisitorIdentity]);
+
+  const renewSession = useCallback(async (reason: string) => {
+    if (!publicId || renewingRef.current) return;
+    renewingRef.current = true;
+    setError(`${reason} Starting a new anonymous session…`);
+    subRef.current?.leave();
+    subRef.current = null;
+    disconnectEcho(echoRef.current);
+    echoRef.current = null;
+    pendingRef.current.clearAll();
+    setMsgs([]);
+    setOlderCursor(null);
+    try {
+      const ac = new AbortController();
+      await startAnonymousSession(publicId, page, ac.signal, true);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Could not start a new session");
+      setConfig(null);
+    } finally {
+      renewingRef.current = false;
+      bumpPending();
+    }
+  }, [page, publicId, startAnonymousSession]);
+
+  const handleApiFailure = useCallback(async (e: unknown) => {
+    if (isAbortError(e)) return;
+    if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
+      await renewSession("Your chat session expired.");
+      return;
+    }
+    setError(e instanceof ApiError ? e.message : "Chat unavailable");
+  }, [renewSession]);
 
   const bootstrap = useCallback(async () => {
     if (!publicId) {
@@ -107,76 +224,125 @@ function RealWidget() {
       setBooting(false);
       return;
     }
+    bootAbortRef.current?.abort();
+    const ac = new AbortController();
+    bootAbortRef.current = ac;
+    genRef.current += 1;
     setError(null);
     setBooting(true);
     try {
-      const cfg = await fetchWidgetConfig(publicId);
-      setConfig(cfg);
-
-      let sessionToken = sessionStorage.getItem(SESSION_KEY(publicId));
-      if (!sessionToken) {
-        const session = await createVisitorSession(publicId);
-        sessionToken = session.token;
-        sessionStorage.setItem(SESSION_KEY(publicId), sessionToken);
-      }
-      setToken(sessionToken);
-
-      let convId = sessionStorage.getItem(CONV_KEY(publicId));
-      if (!convId) {
-        const conv = await createVisitorConversation(sessionToken, { page });
-        convId = conv.id;
-        sessionStorage.setItem(CONV_KEY(publicId), convId);
-      }
-      setConversationId(convId);
-      const list = await fetchVisitorMessages(sessionToken, convId);
-      setMsgs(list);
+      await startAnonymousSession(publicId, page, ac.signal, false);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Chat unavailable");
-      setConfig(null);
+      if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
+        try {
+          await startAnonymousSession(publicId, page, ac.signal, true);
+        } catch (e2) {
+          await handleApiFailure(e2);
+          setConfig(null);
+        }
+      } else {
+        await handleApiFailure(e);
+        if (!(e instanceof ApiError && isVisitorAuthExpired(e.status))) setConfig(null);
+      }
     } finally {
       setBooting(false);
     }
-  }, [publicId, page]);
+  }, [handleApiFailure, page, publicId, startAnonymousSession]);
 
-  useEffect(() => { void bootstrap(); }, [bootstrap]);
+  useEffect(() => {
+    void bootstrap();
+    return () => bootAbortRef.current?.abort();
+  }, [bootstrap]);
 
   useEffect(() => {
     if (!token || !conversationId) return;
-    const poll = window.setInterval(() => {
-      void fetchVisitorMessages(token, conversationId, { after_id: msgs.at(-1)?.id })
-        .then((incoming) => {
-          if (!incoming.length) return;
-          setMsgs((prev) => {
-            const seen = new Set(prev.map((m) => m.id));
-            const merged = [...prev];
-            for (const m of incoming) {
-              if (!seen.has(m.id)) merged.push(m);
-            }
-            return merged;
-          });
-        })
-        .catch(() => { /* keep last good state */ });
-    }, 3000);
-    return () => window.clearInterval(poll);
-  }, [token, conversationId, msgs]);
+    let cancelled = false;
+    const cid = conversationId;
+    const t = token;
 
-  useEffect(() => { end.current?.scrollIntoView({ block: "end" }); }, [msgs.length]);
+    void createVisitorEcho(t).then((echo) => {
+      if (cancelled || tokenRef.current !== t || convRef.current !== cid) {
+        disconnectEcho(echo);
+        return;
+      }
+      disconnectEcho(echoRef.current);
+      echoRef.current = echo;
+      subRef.current?.leave();
+      subRef.current = subscribeToConversation(
+        echo,
+        cid,
+        (msg) => applyIncoming(cid, [msg]),
+        () => {
+          const after = latestServerId(msgsRef.current);
+          void fetchVisitorMessages(t, cid, after ? { after_id: after } : {})
+            .then((page) => applyIncoming(cid, page.data))
+            .catch((e) => void handleApiFailure(e));
+        },
+      );
+    });
+
+    return () => {
+      cancelled = true;
+      subRef.current?.leave();
+      subRef.current = null;
+      disconnectEcho(echoRef.current);
+      echoRef.current = null;
+    };
+  }, [token, conversationId, applyIncoming, handleApiFailure]);
+
+  useEffect(() => { end.current?.scrollIntoView({ block: "end" }); }, [msgs.length, pendingTick]);
+
+  const loadOlder = async () => {
+    if (!token || !conversationId || !olderCursor || loadingOlder) return;
+    setLoadingOlder(true);
+    const cid = conversationId;
+    const t = token;
+    try {
+      const page = await fetchVisitorMessages(t, cid, { cursor: olderCursor });
+      if (convRef.current !== cid) return;
+      setMsgs((prev) => mergeMessages(page.data, prev));
+      setOlderCursor(page.nextCursor);
+    } catch (e) {
+      await handleApiFailure(e);
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
 
   const send = async (text: string) => {
     if (!text.trim() || !token || !conversationId || sending) return;
+    const cid = conversationId;
+    const t = token;
+    const body = text.trim();
+    const pending = pendingRef.current.ensure(cid, body, "visitor", newClientMessageId);
+    bumpPending();
     setSending(true);
     setError(null);
-    const clientId = newClientMessageId();
+    setDraft("");
     try {
-      const msg = await postVisitorMessage(token, conversationId, clientId, text.trim());
-      setMsgs((prev) => (prev.some((m) => m.id === msg.id || m.client_message_id === clientId) ? prev : [...prev, msg]));
-      setDraft("");
+      const msg = await postVisitorMessage(t, cid, pending.clientMessageId, body);
+      if (convRef.current === cid) {
+        pendingRef.current.confirm(cid, pending.clientMessageId);
+        setMsgs((prev) => mergeMessages(prev, [msg]));
+        bumpPending();
+      }
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Could not send");
+      if (isAbortError(e)) return;
+      pendingRef.current.markFailed(cid, pending.clientMessageId);
+      bumpPending();
+      setDraft(body);
+      if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
+        await renewSession("Your chat session expired.");
+      } else {
+        setError(e instanceof ApiError ? e.message : "Could not send");
+      }
     } finally {
       setSending(false);
     }
   };
+
+  void pendingTick;
+  const pendingForActive = conversationId ? pendingRef.current.listFor(conversationId) : [];
 
   if (booting) {
     return <div className="p-6 text-sm text-muted-foreground">Starting chat…</div>;
@@ -191,12 +357,41 @@ function RealWidget() {
     );
   }
 
+  const display = [
+    ...msgs.map((m) => ({
+      key: `m-${m.id}`,
+      from: m.sender_type,
+      text: m.body,
+      time: formatMsgTime(m.created_at),
+    })),
+    ...pendingForActive.map((p) => ({
+      key: `p-${p.clientMessageId}`,
+      from: p.senderType,
+      text: p.text,
+      time: p.status === "failed" ? "failed" : "sending…",
+    })),
+  ];
+
   return (
     <>
-      {error && (
-        <div className="border-b bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
-          {error}{" "}
-          <button type="button" className="underline" onClick={() => void bootstrap()}>Retry</button>
+      {(storageNotice || error) && (
+        <div className="space-y-1 border-b bg-muted/40 px-3 py-2 text-xs" role="status">
+          {storageNotice && <p className="text-muted-foreground">{storageNotice}</p>}
+          {error && (
+            <p className="text-destructive">
+              {error}{" "}
+              <button type="button" className="underline" onClick={() => void bootstrap()}>Retry</button>
+              {" · "}
+              <button type="button" className="underline" onClick={() => void renewSession("Starting fresh.")}>New session</button>
+            </p>
+          )}
+        </div>
+      )}
+      {olderCursor && (
+        <div className="border-b px-3 py-1 text-center">
+          <button type="button" className="text-xs text-primary underline" disabled={loadingOlder} onClick={() => void loadOlder()}>
+            {loadingOlder ? "Loading…" : "Load older messages"}
+          </button>
         </div>
       )}
       <WidgetChrome
@@ -207,14 +402,9 @@ function RealWidget() {
         onSend={(t) => void send(t)}
         onClose={closeParent}
         endRef={end}
-        emptyHints={msgs.length === 0}
+        emptyHints={msgs.length === 0 && pendingForActive.length === 0}
         greeting={config.greeting || `Hi there! Welcome to ${config.name}. How can we help today?`}
-        messages={msgs.map((m) => ({
-          key: String(m.id),
-          from: m.sender_type,
-          text: m.body,
-          time: formatMsgTime(m.created_at),
-        }))}
+        messages={display}
       />
     </>
   );

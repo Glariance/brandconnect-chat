@@ -46,6 +46,14 @@ export type VisitorSession = {
   expires_at: string;
 };
 
+export type CursorPage<T> = {
+  data: T[];
+  nextCursor: string | null;
+  prevCursor: string | null;
+};
+
+type RequestBase = { signal?: AbortSignal };
+
 function unwrapList<T>(payload: unknown): T[] {
   if (Array.isArray(payload)) return payload as T[];
   if (payload && typeof payload === "object" && "data" in payload) {
@@ -62,8 +70,21 @@ function unwrapOne<T>(payload: unknown): T {
   return payload as T;
 }
 
-export async function fetchBrands(): Promise<ApiBrand[]> {
-  return unwrapList(await api("/brands"));
+function cursorFromPayload(payload: unknown): { next: string | null; prev: string | null } {
+  if (!payload || typeof payload !== "object") return { next: null, prev: null };
+  const meta = (payload as { meta?: Record<string, unknown> }).meta;
+  const next = meta && typeof meta.next_cursor === "string" ? meta.next_cursor : null;
+  const prev = meta && typeof meta.prev_cursor === "string" ? meta.prev_cursor : null;
+  return { next, prev };
+}
+
+function asCursorPage<T>(payload: unknown): CursorPage<T> {
+  const { next, prev } = cursorFromPayload(payload);
+  return { data: unwrapList<T>(payload), nextCursor: next, prevCursor: prev };
+}
+
+export async function fetchBrands(opts: RequestBase = {}): Promise<ApiBrand[]> {
+  return unwrapList(await api("/brands", { signal: opts.signal }));
 }
 
 export async function createBrand(input: {
@@ -75,39 +96,44 @@ export async function createBrand(input: {
   return unwrapOne(await api("/brands", { method: "POST", body: input }));
 }
 
-export async function fetchConversations(params: {
-  brand_id?: number | string;
-  status?: string;
-  cursor?: string;
-}): Promise<ApiConversation[]> {
+export async function fetchConversations(
+  params: { brand_id?: number | string; status?: string; cursor?: string } = {},
+  opts: RequestBase = {},
+): Promise<ApiConversation[]> {
   const q = new URLSearchParams();
   if (params.brand_id) q.set("brand_id", String(params.brand_id));
   if (params.status) q.set("status", params.status);
   if (params.cursor) q.set("cursor", params.cursor);
   const qs = q.toString();
-  return unwrapList(await api(`/conversations${qs ? `?${qs}` : ""}`));
+  return unwrapList(await api(`/conversations${qs ? `?${qs}` : ""}`, { signal: opts.signal }));
 }
 
 export async function fetchAgentMessages(
   conversationId: string,
-  params?: { after_id?: number; cursor?: string },
-): Promise<ApiMessage[]> {
+  params: { after_id?: number; cursor?: string } = {},
+  opts: RequestBase = {},
+): Promise<CursorPage<ApiMessage>> {
   const q = new URLSearchParams();
-  if (params?.after_id) q.set("after_id", String(params.after_id));
-  if (params?.cursor) q.set("cursor", params.cursor);
+  if (params.after_id) q.set("after_id", String(params.after_id));
+  if (params.cursor) q.set("cursor", params.cursor);
   const qs = q.toString();
-  return unwrapList(await api(`/conversations/${conversationId}/messages${qs ? `?${qs}` : ""}`));
+  const payload = await api(`/conversations/${conversationId}/messages${qs ? `?${qs}` : ""}`, {
+    signal: opts.signal,
+  });
+  return asCursorPage<ApiMessage>(payload);
 }
 
 export async function postAgentMessage(
   conversationId: string,
   clientMessageId: string,
   text: string,
+  opts: RequestBase = {},
 ): Promise<ApiMessage> {
   return unwrapOne(
     await api(`/conversations/${conversationId}/messages`, {
       method: "POST",
       body: { client_message_id: clientMessageId, text },
+      signal: opts.signal,
     }),
   );
 }
@@ -127,23 +153,31 @@ export async function patchConversationStatus(
 export async function markConversationRead(
   conversationId: string,
   messageId: number,
+  opts: RequestBase = {},
 ): Promise<void> {
   await api(`/conversations/${conversationId}/read`, {
     method: "POST",
     body: { message_id: messageId },
+    signal: opts.signal,
   });
 }
 
-export async function fetchWidgetConfig(publicId: string): Promise<WidgetConfig> {
-  return unwrapOne(await api(`/widget/brands/${encodeURIComponent(publicId)}/config`, { public: true }));
+export async function fetchWidgetConfig(publicId: string, opts: RequestBase = {}): Promise<WidgetConfig> {
+  return unwrapOne(
+    await api(`/widget/brands/${encodeURIComponent(publicId)}/config`, {
+      public: true,
+      signal: opts.signal,
+    }),
+  );
 }
 
-export async function createVisitorSession(publicId: string): Promise<VisitorSession> {
+export async function createVisitorSession(publicId: string, opts: RequestBase = {}): Promise<VisitorSession> {
   return unwrapOne(
     await api(`/widget/brands/${encodeURIComponent(publicId)}/sessions`, {
       method: "POST",
       public: true,
       body: {},
+      signal: opts.signal,
     }),
   );
 }
@@ -151,12 +185,14 @@ export async function createVisitorSession(publicId: string): Promise<VisitorSes
 export async function createVisitorConversation(
   token: string,
   input: { page?: string },
+  opts: RequestBase = {},
 ): Promise<ApiConversation> {
   return unwrapOne(
     await api("/widget/conversations", {
       method: "POST",
       bearer: token,
       body: input,
+      signal: opts.signal,
     }),
   );
 }
@@ -164,16 +200,18 @@ export async function createVisitorConversation(
 export async function fetchVisitorMessages(
   token: string,
   conversationId: string,
-  params?: { after_id?: number },
-): Promise<ApiMessage[]> {
+  params: { after_id?: number; cursor?: string } = {},
+  opts: RequestBase = {},
+): Promise<CursorPage<ApiMessage>> {
   const q = new URLSearchParams();
-  if (params?.after_id) q.set("after_id", String(params.after_id));
+  if (params.after_id) q.set("after_id", String(params.after_id));
+  if (params.cursor) q.set("cursor", params.cursor);
   const qs = q.toString();
-  return unwrapList(
-    await api(`/widget/conversations/${conversationId}/messages${qs ? `?${qs}` : ""}`, {
-      bearer: token,
-    }),
-  );
+  const payload = await api(`/widget/conversations/${conversationId}/messages${qs ? `?${qs}` : ""}`, {
+    bearer: token,
+    signal: opts.signal,
+  });
+  return asCursorPage<ApiMessage>(payload);
 }
 
 export async function postVisitorMessage(
@@ -181,12 +219,14 @@ export async function postVisitorMessage(
   conversationId: string,
   clientMessageId: string,
   text: string,
+  opts: RequestBase = {},
 ): Promise<ApiMessage> {
   return unwrapOne(
     await api(`/widget/conversations/${conversationId}/messages`, {
       method: "POST",
       bearer: token,
       body: { client_message_id: clientMessageId, text },
+      signal: opts.signal,
     }),
   );
 }
@@ -195,11 +235,13 @@ export async function markVisitorRead(
   token: string,
   conversationId: string,
   messageId: number,
+  opts: RequestBase = {},
 ): Promise<void> {
   await api(`/widget/conversations/${conversationId}/read`, {
     method: "POST",
     bearer: token,
     body: { message_id: messageId },
+    signal: opts.signal,
   });
 }
 
@@ -230,4 +272,22 @@ export function formatMsgTime(iso: string): string {
   } catch {
     return "";
   }
+}
+
+export function messageFromBroadcast(payload: unknown): ApiMessage | null {
+  if (!payload || typeof payload !== "object") return null;
+  const message = (payload as { message?: unknown }).message ?? payload;
+  if (!message || typeof message !== "object") return null;
+  const m = message as Record<string, unknown>;
+  if (typeof m.id !== "number" || typeof m.conversation_id !== "string" || typeof m.body !== "string") {
+    return null;
+  }
+  return {
+    id: m.id,
+    conversation_id: m.conversation_id,
+    client_message_id: String(m.client_message_id ?? ""),
+    sender_type: (m.sender_type as ApiMessage["sender_type"]) ?? "bot",
+    body: m.body,
+    created_at: String(m.created_at ?? new Date().toISOString()),
+  };
 }

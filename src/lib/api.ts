@@ -17,6 +17,13 @@ export class ApiError extends Error {
   }
 }
 
+export function isAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError")
+  );
+}
+
 let csrfReady = false;
 
 async function ensureCsrf(): Promise<void> {
@@ -31,7 +38,7 @@ async function ensureCsrf(): Promise<void> {
   csrfReady = true;
 }
 
-function xsrfToken(): string | null {
+export function xsrfToken(): string | null {
   if (typeof document === "undefined") return null;
   const match = document.cookie.match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
   return match ? decodeURIComponent(match[1]!) : null;
@@ -43,6 +50,9 @@ type RequestOpts = {
   bearer?: string | null;
   /** Skip CSRF bootstrap (GET-only public endpoints). */
   public?: boolean;
+  signal?: AbortSignal;
+  /** Absolute path under the API origin (defaults to /api/v1 + path). */
+  absolutePath?: string;
 };
 
 export async function api<T = unknown>(path: string, opts: RequestOpts = {}): Promise<T> {
@@ -65,11 +75,16 @@ export async function api<T = unknown>(path: string, opts: RequestOpts = {}): Pr
     headers["Content-Type"] = "application/json";
   }
 
-  const res = await fetch(`${API_URL}/api/v1${path}`, {
+  const url = opts.absolutePath
+    ? `${API_URL}${opts.absolutePath}`
+    : `${API_URL}/api/v1${path}`;
+
+  const res = await fetch(url, {
     method,
     credentials: opts.bearer ? "omit" : "include",
     headers,
     body: opsBody(opts.body),
+    signal: opts.signal,
   });
 
   if (res.status === 204) {
@@ -108,4 +123,13 @@ export function apiBaseUrl(): string {
 
 export function resetCsrf(): void {
   csrfReady = false;
+}
+
+export function reverbEnv() {
+  return {
+    key: viteEnv.VITE_REVERB_APP_KEY ?? "",
+    host: viteEnv.VITE_REVERB_HOST ?? "localhost",
+    port: Number(viteEnv.VITE_REVERB_PORT ?? 8081),
+    scheme: viteEnv.VITE_REVERB_SCHEME ?? "http",
+  };
 }
