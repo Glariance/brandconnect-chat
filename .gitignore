@@ -19,6 +19,10 @@ dist-ssr
 .env.*
 !.env.example
 
+# Local multi-process launcher lock/stop (npm run dev:all)
+.dev-all.lock
+.dev-all.stop
+
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars

@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev",
+    "dev:all": "node scripts/dev-all.mjs",
+    "dev:all:stop": "node scripts/dev-all.mjs --stop",
     "build": "vite build",
     "build:dev": "vite build --mode development",
     "preview": "vite preview",

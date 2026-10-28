@@ -8,10 +8,51 @@ Milestone 1 uses the existing Laravel app in `api/` and the TanStack frontend at
 |---------|------|---------|
 | Laravel API | **8000** | `cd api && php artisan serve --host=127.0.0.1 --port=8000` |
 | Frontend (Vite / Lovable) | **8080** | `npm run dev` (repo root) |
-| Laravel Reverb | **8081** | `cd api && php artisan reverb:start` |
-| Queue worker | — | `cd api && php artisan queue:work --tries=1 --sleep=1` |
+| Laravel Reverb | **8081** | `cd api && php artisan reverb:start --host=127.0.0.1 --port=8081` |
+| Queue worker | — | `cd api && php artisan queue:work --sleep=1 --tries=3` |
 
 Use the **same host style** everywhere (`localhost` *or* `127.0.0.1`). Mixing them breaks Sanctum cookies.
+
+## One-command local stack (`npm run dev:all`)
+
+**Local development only.** Starts API, Vite frontend, Reverb, and a queue worker from the repo root after first-time setup is done.
+
+### First-time prerequisites (not performed by the launcher)
+
+1. Install PHP 8.3+ (Laragon), Node 20+, Composer, MySQL — see Prerequisites below.
+2. Create the database and copy/configure `api/.env` and root `.env` (never commit secrets).
+3. `cd api && composer install && php artisan key:generate && php artisan migrate` (+ provision owner as needed).
+4. At repo root: `npm install`.
+5. Align `VITE_REVERB_*` with `api` Reverb keys (see Frontend env). Do **not** put `REVERB_APP_SECRET` in `VITE_*`.
+
+Optional PHP override (machine-local, not committed):
+
+```powershell
+$env:PHP_BINARY = "D:\laragon\bin\php\php-8.3.30\php.exe"
+```
+
+The launcher prefers `PHP_BINARY`, then `php` on PATH, then the Laragon path above.
+
+### Start / stop
+
+```powershell
+cd D:\laragon\www\awsodesk
+npm run dev:all
+```
+
+- Logs are prefixed `[FRONTEND]`, `[API]`, `[REVERB]`, `[QUEUE]` (plus `[LAUNCHER]` status).
+- “Starting” means the child process was spawned; “READY” means HTTP (API/frontend) or TCP (Reverb) checks passed. Queue “running” does **not** prove message delivery.
+- Stop with **Ctrl+C** in that terminal — the launcher terminates its process tree (including Windows child processes) and removes `.dev-all.lock`.
+- From another terminal: `npm run dev:all:stop` (writes `.dev-all.stop` for a graceful shutdown, then force-cleans lock children if needed).
+- Existing `npm run dev` (frontend only) is unchanged.
+
+### Port conflicts
+
+If 8000 / 8080 / 8081 is already taken, `dev:all` **exits with instructions** and does **not** kill the existing process. Free the port yourself (or stop a previous stack), then retry.
+
+### Duplicate launchers
+
+A second `npm run dev:all` while the first is alive refuses to start (`.dev-all.lock`). If a crash left a stale lock and no process holds that PID, the next run clears it.
 
 ## Realtime behavior (current)
 
@@ -99,27 +140,26 @@ php artisan brandconnect:provision-owner --email=you@example.com --name="Your Na
 
 Omit `--password` so the command prompts securely. Do **not** commit a shared demo password. Do **not** use `migrate:fresh` on a shared database.
 
-## Run processes (four terminals)
+## Manual four-terminal fallback
+
+Prefer `npm run dev:all` when possible. Equivalent manual commands:
 
 ```bat
 cd api
 php artisan serve --host=127.0.0.1 --port=8000
 
 cd api
-php artisan reverb:start
+php artisan reverb:start --host=127.0.0.1 --port=8081
 
 cd api
-php artisan queue:work --tries=1 --sleep=1
+php artisan queue:work --sleep=1 --tries=3
 
 cd (repo root)
-copy .env.example .env
-REM set VITE_API_URL=http://localhost:8000 and VITE_REAL_CHAT=true
-REM set VITE_REVERB_* to match api/.env (port 8081) — never VITE_REVERB_APP_SECRET
-npm install
+REM ensure .env exists with VITE_* (never VITE_REVERB_APP_SECRET)
 npm run dev
 ```
 
-Frontend listens on **8080**; open `http://localhost:8080/login`.
+Frontend listens on **8080** (`strictPort`); open `http://localhost:8080/login` or `http://127.0.0.1:8080/login`.
 
 ## Frontend env (`/.env`)
 
