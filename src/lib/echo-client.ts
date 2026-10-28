@@ -9,6 +9,8 @@ import { messageFromBroadcast } from "@/lib/chat-api";
 
 export type RealtimeStatus = "connecting" | "live" | "polling" | "unavailable";
 
+export type ConnectionLostReason = "disconnected" | "unavailable" | "failed" | "timeout";
+
 export type EchoChannel = {
   listen: (event: string, cb: (payload: unknown) => void) => unknown;
   stopListening: (event: string) => unknown;
@@ -127,11 +129,17 @@ export type SubscribeHandlers = {
   /** Fires after private-channel authorization/subscription succeeds (initial + resubscribe). */
   onSubscribed?: () => void;
   onSubscriptionError?: (error: unknown) => void;
+  /** Socket disconnected / unavailable / failed, or subscription timeout. */
+  onConnectionLost?: (reason: ConnectionLostReason) => void;
+  /** Start HTTP fallback if channel.subscribed never fires. Default 10000ms. */
+  subscriptionTimeoutMs?: number | undefined;
 };
+
+const CONNECTION_LOST_EVENTS = ["disconnected", "unavailable", "failed"] as const;
 
 /**
  * Subscribe to conversations.{id} / .message.created.
- * After leave(), message/subscribed callbacks are no-ops.
+ * After leave(), all callbacks are no-ops; handlers/timers are cleaned up.
  */
 export function subscribeToConversation(
   echo: EchoLike,
@@ -139,8 +147,11 @@ export function subscribeToConversation(
   handlers: SubscribeHandlers,
 ): ConversationSubscription {
   let active = true;
+  let subscribedOnce = false;
   const channelName = `conversations.${conversationId}`;
   const channel = echo.private(channelName);
+  const connection = echo.connector?.pusher?.connection;
+  const timeoutMs = handlers.subscriptionTimeoutMs ?? 10_000;
 
   const handler = (payload: unknown) => {
     if (!active) return;
@@ -150,8 +161,17 @@ export function subscribeToConversation(
 
   channel.listen(".message.created", handler);
 
+  const clearSubTimeout = () => {
+    if (subTimeout != null) {
+      window.clearTimeout(subTimeout);
+      subTimeout = null;
+    }
+  };
+
   const onSubscribed = () => {
     if (!active) return;
+    subscribedOnce = true;
+    clearSubTimeout();
     handlers.onSubscribed?.();
   };
   const onError = (err: unknown) => {
@@ -162,19 +182,33 @@ export function subscribeToConversation(
   channel.subscribed?.(onSubscribed);
   channel.error?.(onError);
 
-  // Some Echo/Pusher builds expose subscription success only via the connection binder.
-  // Also re-run catch-up when the socket reconnects *and* the channel is still active —
-  // callers should still prefer onSubscribed; this is a safety net that only fires while active.
-  const connection = echo.connector?.pusher?.connection;
   const onConnected = () => {
     if (!active) return;
     // Do not treat socket connected alone as subscribed; wait for channel.subscribed.
     // If the channel API lacks subscribed(), fall back so catch-up still runs once.
     if (typeof channel.subscribed !== "function") {
-      handlers.onSubscribed?.();
+      onSubscribed();
     }
   };
+
+  const onConnectionLost = (reason: ConnectionLostReason) => {
+    if (!active) return;
+    handlers.onConnectionLost?.(reason);
+  };
+
   connection?.bind("connected", onConnected);
+  const lostHandlers: Array<[ConnectionLostReason, (...args: unknown[]) => void]> = [];
+  for (const event of CONNECTION_LOST_EVENTS) {
+    const fn = () => onConnectionLost(event);
+    lostHandlers.push([event, fn]);
+    connection?.bind(event, fn);
+  }
+
+  let subTimeout: number | null = window.setTimeout(() => {
+    subTimeout = null;
+    if (!active || subscribedOnce) return;
+    onConnectionLost("timeout");
+  }, timeoutMs);
 
   return {
     get active() {
@@ -183,6 +217,7 @@ export function subscribeToConversation(
     leave: () => {
       if (!active) return;
       active = false;
+      clearSubTimeout();
       try {
         channel.stopListening(".message.created");
       } catch {
@@ -198,6 +233,13 @@ export function subscribeToConversation(
       } catch {
         /* ignore */
       }
+      for (const [event, fn] of lostHandlers) {
+        try {
+          connection?.unbind(event, fn);
+        } catch {
+          /* ignore */
+        }
+      }
     },
   };
 }
@@ -211,13 +253,49 @@ export function disconnectEcho(echo: EchoLike | null | undefined): void {
   }
 }
 
-/** Bounded message polling while realtime is unavailable. Returns a disposer. */
+/**
+ * Non-overlapping bounded polling. The next tick is scheduled only after the
+ * previous tick settles. Returns a disposer that clears the pending timer.
+ */
 export function startBoundedMessagePolling(
-  tick: () => void,
+  tick: () => void | Promise<void>,
   intervalMs = 3000,
 ): () => void {
-  const id = window.setInterval(tick, intervalMs);
-  return () => window.clearInterval(id);
+  let stopped = false;
+  let inFlight = false;
+  let timer: number | null = null;
+
+  const clearTimer = () => {
+    if (timer != null) {
+      window.clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const schedule = () => {
+    if (stopped) return;
+    clearTimer();
+    timer = window.setTimeout(() => {
+      timer = null;
+      void (async () => {
+        if (stopped || inFlight) return;
+        inFlight = true;
+        try {
+          await tick();
+        } finally {
+          inFlight = false;
+          schedule();
+        }
+      })();
+    }, intervalMs);
+  };
+
+  schedule();
+
+  return () => {
+    stopped = true;
+    clearTimer();
+  };
 }
 
 export function realtimeStatusLabel(status: RealtimeStatus): string {

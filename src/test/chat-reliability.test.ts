@@ -17,7 +17,7 @@ import {
   type EchoChannel,
   type EchoLike,
 } from "@/lib/echo-client";
-import { drainCatchUpAfter } from "@/lib/catch-up";
+import { applyCatchUpResult, drainCatchUpAfter, HttpSyncWatermark } from "@/lib/catch-up";
 import * as api from "@/lib/api";
 
 function msg(partial: Partial<ApiMessage> & Pick<ApiMessage, "id" | "body">): ApiMessage {
@@ -33,8 +33,14 @@ function msg(partial: Partial<ApiMessage> & Pick<ApiMessage, "id" | "body">): Ap
 function makeEcho(overrides?: {
   subscribed?: (cb: () => void) => unknown;
   error?: (cb: (err: unknown) => void) => unknown;
-}): { echo: EchoLike; channel: EchoChannel; getHandler: () => ((payload: unknown) => void) | null } {
+}): {
+  echo: EchoLike;
+  channel: EchoChannel;
+  getHandler: () => ((payload: unknown) => void) | null;
+  connectionHandlers: Map<string, Array<(...args: unknown[]) => void>>;
+} {
   let handler: ((payload: unknown) => void) | null = null;
+  const connectionHandlers = new Map<string, Array<(...args: unknown[]) => void>>();
   const channel: EchoChannel = {
     listen: (_event, cb) => {
       handler = cb;
@@ -51,13 +57,24 @@ function makeEcho(overrides?: {
     connector: {
       pusher: {
         connection: {
-          bind: vi.fn(),
-          unbind: vi.fn(),
+          bind: (event, cb) => {
+            const list = connectionHandlers.get(event) ?? [];
+            list.push(cb);
+            connectionHandlers.set(event, list);
+          },
+          unbind: vi.fn((event: string, cb?: (...args: unknown[]) => void) => {
+            if (!cb) {
+              connectionHandlers.delete(event);
+              return;
+            }
+            const list = (connectionHandlers.get(event) ?? []).filter((h) => h !== cb);
+            connectionHandlers.set(event, list);
+          }),
         },
       },
     },
   };
-  return { echo, channel, getHandler: () => handler };
+  return { echo, channel, getHandler: () => handler, connectionHandlers };
 }
 
 describe("pending client_message_id stability", () => {
@@ -216,15 +233,34 @@ describe("Echo null / rejected initialization", () => {
     await expect(createVisitorEcho("tok")).resolves.toBeNull();
   });
 
-  it("bounded polling disposer clears the interval timer", () => {
+  it("bounded polling is non-overlapping and disposer clears the timer", async () => {
     vi.useFakeTimers();
-    const tick = vi.fn();
+    let release!: () => void;
+    const tick = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
     const stop = startBoundedMessagePolling(tick, 1000);
-    vi.advanceTimersByTime(3000);
-    expect(tick).toHaveBeenCalledTimes(3);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(tick).toHaveBeenCalledTimes(1);
+
+    // Still in flight — another interval must not start a second tick.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tick).toHaveBeenCalledTimes(1);
+
+    release();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(tick).toHaveBeenCalledTimes(2);
+
     stop();
-    vi.advanceTimersByTime(5000);
-    expect(tick).toHaveBeenCalledTimes(3);
+    release();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tick).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
 });
@@ -245,6 +281,7 @@ describe("catch-up drain and concurrent merge", () => {
     expect(fetchPage.mock.calls[0]?.[0]).toEqual({ after_id: 0 });
     expect(fetchPage.mock.calls[1]?.[0]).toEqual({ after_id: 0, cursor: "cursor-2" });
     expect(result.complete).toBe(true);
+    expect(result.confirmedThroughId).toBe(125);
     expect(result.messages).toHaveLength(125);
     expect(result.messages[0]?.id).toBe(1);
     expect(result.messages.at(-1)?.id).toBe(125);
@@ -259,6 +296,7 @@ describe("catch-up drain and concurrent merge", () => {
 
     const result = await drainCatchUpAfter(0, fetchPage);
     expect(result.complete).toBe(false);
+    expect(result.confirmedThroughId).toBe(1);
     expect(result.messages.map((m) => m.id)).toEqual([1]);
     expect(fetchPage).toHaveBeenCalledTimes(2);
   });
@@ -271,6 +309,7 @@ describe("catch-up drain and concurrent merge", () => {
 
     const result = await drainCatchUpAfter(0, fetchPage);
     expect(result.complete).toBe(false);
+    expect(result.confirmedThroughId).toBe(1);
     expect(result.messages.map((m) => m.id)).toEqual([1]);
   });
 
@@ -294,6 +333,50 @@ describe("catch-up drain and concurrent merge", () => {
     applyIncoming(result.messages);
     expect(live.map((m) => m.id)).toEqual([10, 11, 12]);
     expect(live.find((m) => m.id === 12)?.body).toBe("from http dup");
+  });
+
+  it("keeps HTTP watermark when Echo arrives after a partial catch-up, and retry fills every gap", async () => {
+    const watermark = new HttpSyncWatermark();
+    watermark.reset(10);
+    let display: ApiMessage[] = [msg({ id: 10, body: "base" })];
+
+    const page1 = Array.from({ length: 10 }, (_, i) => msg({ id: 11 + i, body: `http-${11 + i}` }));
+    const firstFetch = vi
+      .fn()
+      .mockResolvedValueOnce({ data: page1, nextCursor: "page-2", prevCursor: null })
+      .mockRejectedValueOnce(new Error("page 2 failed"));
+
+    const first = await drainCatchUpAfter(watermark.current!, firstFetch);
+    // Higher-ID Echo message arrives while recovery is incomplete.
+    const echoHigh = msg({ id: 50, body: "echo-ahead" });
+    const applied = applyCatchUpResult(watermark, display, first, [echoHigh]);
+    display = applied.display;
+
+    expect(first.complete).toBe(false);
+    expect(applied.complete).toBe(false);
+    expect(applied.readThroughId).toBeUndefined(); // do not mark read beyond the gap
+    expect(latestServerId(display)).toBe(50);
+    expect(watermark.current).toBe(20); // Echo must not advance watermark past HTTP
+
+    const missing = Array.from({ length: 30 }, (_, i) => msg({ id: 21 + i, body: `gap-${21 + i}` }));
+    const retryFetch = vi.fn().mockResolvedValue({
+      data: missing,
+      nextCursor: null,
+      prevCursor: null,
+    });
+
+    const retry = await drainCatchUpAfter(watermark.current!, retryFetch);
+    const recovered = applyCatchUpResult(watermark, display, retry);
+    display = recovered.display;
+
+    expect(retryFetch.mock.calls[0]?.[0]).toEqual({ after_id: 20 });
+    expect(retry.complete).toBe(true);
+    expect(recovered.complete).toBe(true);
+    expect(recovered.readThroughId).toBe(50);
+    expect(watermark.current).toBe(50);
+    expect(display.map((m) => m.id)).toEqual(
+      Array.from({ length: 41 }, (_, i) => 10 + i),
+    );
   });
 });
 
@@ -379,5 +462,160 @@ describe("Echo subscription lifecycle", () => {
     subscribeToConversation(echo, "conv-1", { onMessage });
     getHandler()?.({ message: msg({ id: 1, body: "ok", conversation_id: "conv-1" }) });
     expect(onMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("successful subscription followed by disconnect starts polling via onConnectionLost", () => {
+    const subscribedCbs: Array<() => void> = [];
+    const { echo, connectionHandlers } = makeEcho({
+      subscribed: (cb) => {
+        subscribedCbs.push(cb);
+        return undefined;
+      },
+    });
+    const onSubscribed = vi.fn();
+    const onConnectionLost = vi.fn();
+    const startPolling = vi.fn();
+
+    subscribeToConversation(echo, "conv-1", {
+      onMessage: vi.fn(),
+      onSubscribed: () => {
+        onSubscribed();
+      },
+      onConnectionLost: (reason) => {
+        onConnectionLost(reason);
+        startPolling();
+      },
+    });
+
+    subscribedCbs.forEach((cb) => cb());
+    expect(onSubscribed).toHaveBeenCalledTimes(1);
+
+    (connectionHandlers.get("disconnected") ?? []).forEach((cb) => cb());
+    expect(onConnectionLost).toHaveBeenCalledWith("disconnected");
+    expect(startPolling).toHaveBeenCalledTimes(1);
+  });
+
+  it("connection/subscription timeout starts polling", () => {
+    vi.useFakeTimers();
+    const { echo } = makeEcho({
+      subscribed: () => undefined, // never fires
+    });
+    const onConnectionLost = vi.fn();
+    const startPolling = vi.fn();
+
+    subscribeToConversation(echo, "conv-1", {
+      onMessage: vi.fn(),
+      onConnectionLost: (reason) => {
+        onConnectionLost(reason);
+        startPolling();
+      },
+      subscriptionTimeoutMs: 2000,
+    });
+
+    vi.advanceTimersByTime(1999);
+    expect(onConnectionLost).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onConnectionLost).toHaveBeenCalledWith("timeout");
+    expect(startPolling).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it("reconnect completes recovery and stops polling", async () => {
+    vi.useFakeTimers();
+    const subscribedCbs: Array<() => void> = [];
+    const { echo, connectionHandlers } = makeEcho({
+      subscribed: (cb) => {
+        subscribedCbs.push(cb);
+        return undefined;
+      },
+    });
+
+    const watermark = new HttpSyncWatermark();
+    watermark.reset(5);
+    let polling = false;
+    let live = false;
+    let pollStop: (() => void) | null = null;
+    let channelReady = false;
+    let recovery = Promise.resolve();
+
+    const stopPolling = () => {
+      pollStop?.();
+      pollStop = null;
+      polling = false;
+    };
+
+    const startPolling = () => {
+      polling = true;
+      live = false;
+      if (pollStop) return;
+      pollStop = startBoundedMessagePolling(async () => {
+        const result = await drainCatchUpAfter(watermark.current!, async () => ({
+          data: [msg({ id: (watermark.current ?? 0) + 1, body: "poll" })],
+          nextCursor: null,
+          prevCursor: null,
+        }));
+        watermark.advanceFromHttp(result.confirmedThroughId);
+        if (result.complete && channelReady) {
+          stopPolling();
+          live = true;
+        }
+      }, 1000);
+    };
+
+    const runSubscribedRecovery = () => {
+      channelReady = true;
+      recovery = (async () => {
+        const result = await drainCatchUpAfter(watermark.current!, async () => ({
+          data: [],
+          nextCursor: null,
+          prevCursor: null,
+        }));
+        watermark.advanceFromHttp(result.confirmedThroughId);
+        if (result.complete) {
+          stopPolling();
+          live = true;
+        } else {
+          startPolling();
+        }
+      })();
+      return recovery;
+    };
+
+    subscribeToConversation(echo, "conv-1", {
+      onMessage: vi.fn(),
+      onSubscribed: () => {
+        void runSubscribedRecovery();
+      },
+      onConnectionLost: () => {
+        channelReady = false;
+        startPolling();
+      },
+      subscriptionTimeoutMs: 60_000,
+    });
+
+    // Initial subscribe → live
+    subscribedCbs.forEach((cb) => cb());
+    await recovery;
+    expect(live).toBe(true);
+    expect(polling).toBe(false);
+
+    // Disconnect → polling
+    (connectionHandlers.get("disconnected") ?? []).forEach((cb) => cb());
+    expect(polling).toBe(true);
+    expect(live).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.resolve();
+    expect(polling).toBe(true); // still disconnected
+
+    // Resubscribe (reconnect) → catch-up completes → stop polling
+    subscribedCbs.forEach((cb) => cb());
+    await recovery;
+    expect(channelReady).toBe(true);
+    expect(live).toBe(true);
+    expect(polling).toBe(false);
+    expect(pollStop).toBeNull();
+
+    vi.useRealTimers();
   });
 });

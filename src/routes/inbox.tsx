@@ -26,7 +26,7 @@ import {
   type EchoLike,
   type RealtimeStatus,
 } from "@/lib/echo-client";
-import { drainCatchUpAfter } from "@/lib/catch-up";
+import { drainCatchUpAfter, HttpSyncWatermark } from "@/lib/catch-up";
 import { latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
 
 export const Route = createFileRoute("/inbox")({
@@ -112,12 +112,15 @@ function RealInbox() {
   const draftsRef = useRef(new Map<string, string>());
   const activeRef = useRef<string | null>(null);
   const msgsRef = useRef<ApiMessage[]>([]);
+  const syncWatermarkRef = useRef(new HttpSyncWatermark());
   const listAbortRef = useRef<AbortController | null>(null);
   const msgsAbortRef = useRef<AbortController | null>(null);
   const echoRef = useRef<EchoLike | null>(null);
   const echoReadyRef = useRef(false);
   const subRef = useRef<ConversationSubscription | null>(null);
   const pollStopRef = useRef<(() => void) | null>(null);
+  /** True only between channel.subscribed and connection-lost / leave. */
+  const channelReadyRef = useRef(false);
   const convGenRef = useRef(0);
 
   activeRef.current = active;
@@ -126,6 +129,7 @@ function RealInbox() {
   const bumpPending = () => setPendingTick((n) => n + 1);
 
   const applyIncoming = useCallback((conversationId: string, incoming: ApiMessage[]) => {
+    // Echo / display merge only — does not advance HTTP sync watermark.
     if (activeRef.current !== conversationId) return;
     setMsgs((prev) => {
       const merged = mergeMessages(prev, incoming);
@@ -137,23 +141,25 @@ function RealInbox() {
     bumpPending();
   }, []);
 
-  const runCatchUp = useCallback(async (conversationId: string, signal?: AbortSignal) => {
+  const runCatchUp = useCallback(async (conversationId: string, signal?: AbortSignal): Promise<{ complete: boolean }> => {
     const gen = convGenRef.current;
-    const afterId = latestServerId(msgsRef.current);
+    const afterId = syncWatermarkRef.current.current;
     if (afterId == null) {
       try {
         const page = await fetchAgentMessages(conversationId, {}, { signal });
-        if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+        if (gen !== convGenRef.current || activeRef.current !== conversationId) return { complete: false };
         setMsgs((prev) => mergeMessages(prev, page.data));
         setOlderCursor((c) => c ?? page.nextCursor);
+        syncWatermarkRef.current.reset(latestServerId(page.data));
         for (const m of page.data) {
           if (m.client_message_id) pendingRef.current.confirm(conversationId, m.client_message_id);
         }
         bumpPending();
+        return { complete: true };
       } catch (e) {
-        if (isAbortError(e) || gen !== convGenRef.current) return;
+        if (isAbortError(e) || gen !== convGenRef.current) return { complete: false };
+        return { complete: false };
       }
-      return;
     }
 
     const result = await drainCatchUpAfter(
@@ -168,12 +174,20 @@ function RealInbox() {
       },
     );
 
-    if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+    if (gen !== convGenRef.current || activeRef.current !== conversationId) return { complete: false };
+
+    // Advance watermark from HTTP only — Echo arrivals already in display do not move it.
+    syncWatermarkRef.current.advanceFromHttp(result.confirmedThroughId);
     if (result.messages.length) applyIncoming(conversationId, result.messages);
-    const readId = latestServerId(msgsRef.current);
-    if (readId) {
-      try { await markConversationRead(conversationId, readId, { signal }); } catch { /* ignore */ }
+
+    if (result.complete) {
+      const readId = syncWatermarkRef.current.current;
+      if (readId) {
+        try { await markConversationRead(conversationId, readId, { signal }); } catch { /* ignore */ }
+      }
     }
+    // Incomplete: retain safe recovery position; do not mark read beyond the unfilled gap.
+    return { complete: result.complete };
   }, [applyIncoming]);
 
   const loadList = useCallback(async () => {
@@ -246,6 +260,7 @@ function RealInbox() {
     // Preserve pending sends across switches; only swap transcript + draft.
     setMsgs([]);
     setOlderCursor(null);
+    syncWatermarkRef.current.reset(undefined);
     if (active) {
       setDraft(draftsRef.current.get(active) ?? "");
     } else {
@@ -260,6 +275,7 @@ function RealInbox() {
     const conversationId = active;
     const ac = new AbortController();
     msgsAbortRef.current = ac;
+    let cancelled = false;
 
     void (async () => {
       try {
@@ -267,11 +283,12 @@ function RealInbox() {
         if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
         setMsgs(page.data);
         setOlderCursor(page.nextCursor);
+        syncWatermarkRef.current.reset(latestServerId(page.data));
         for (const m of page.data) {
           if (m.client_message_id) pendingRef.current.confirm(conversationId, m.client_message_id);
         }
         bumpPending();
-        const readId = latestServerId(page.data);
+        const readId = syncWatermarkRef.current.current;
         if (readId) {
           try { await markConversationRead(conversationId, readId, { signal: ac.signal }); } catch { /* ignore */ }
         }
@@ -281,38 +298,67 @@ function RealInbox() {
       }
     })();
 
-    const startPollingFallback = () => {
+    channelReadyRef.current = false;
+
+    const stopPollingAfterRecovery = () => {
       pollStopRef.current?.();
-      setRealtime((s) => (s === "live" ? s : "polling"));
-      pollStopRef.current = startBoundedMessagePolling(() => {
-        if (activeRef.current !== conversationId) return;
-        void runCatchUp(conversationId);
+      pollStopRef.current = null;
+    };
+
+    const startPollingFallback = () => {
+      if (cancelled || activeRef.current !== conversationId) return;
+      setRealtime("polling");
+      if (pollStopRef.current) return;
+      pollStopRef.current = startBoundedMessagePolling(async () => {
+        if (cancelled || activeRef.current !== conversationId) return;
+        const { complete } = await runCatchUp(conversationId);
+        if (cancelled || activeRef.current !== conversationId) return;
+        // Stop only when channel is subscribed again and catch-up finished.
+        if (complete && channelReadyRef.current) {
+          stopPollingAfterRecovery();
+          setRealtime("live");
+        }
       }, 3000);
     };
 
     const attachSubscription = (echo: EchoLike) => {
       subRef.current?.leave();
+      channelReadyRef.current = false;
       subRef.current = subscribeToConversation(echo, conversationId, {
         onMessage: (msg) => applyIncoming(conversationId, [msg]),
         onSubscribed: () => {
-          if (activeRef.current !== conversationId || !subRef.current?.active) return;
-          pollStopRef.current?.();
-          pollStopRef.current = null;
-          setRealtime("live");
-          void runCatchUp(conversationId, ac.signal);
+          if (cancelled || activeRef.current !== conversationId || !subRef.current?.active) return;
+          channelReadyRef.current = true;
+          void (async () => {
+            const { complete } = await runCatchUp(conversationId, ac.signal);
+            if (cancelled || activeRef.current !== conversationId || !subRef.current?.active) return;
+            // Stop fallback only after subscription succeeds AND catch-up completes.
+            if (complete) {
+              stopPollingAfterRecovery();
+              setRealtime("live");
+            } else {
+              startPollingFallback();
+            }
+          })();
         },
         onSubscriptionError: () => {
-          if (activeRef.current !== conversationId) return;
-          setRealtime("polling");
+          if (cancelled || activeRef.current !== conversationId) return;
+          channelReadyRef.current = false;
           startPollingFallback();
         },
+        onConnectionLost: () => {
+          if (cancelled || activeRef.current !== conversationId) return;
+          channelReadyRef.current = false;
+          startPollingFallback();
+        },
+        subscriptionTimeoutMs: 10_000,
       });
     };
 
     const waitForEcho = window.setInterval(() => {
       if (!echoReadyRef.current) return;
       window.clearInterval(waitForEcho);
-      if (activeRef.current !== conversationId) return;
+      if (cancelled || activeRef.current !== conversationId) return;
       const echo = echoRef.current;
       if (!echo) {
         startPollingFallback();
@@ -322,6 +368,8 @@ function RealInbox() {
     }, 50);
 
     return () => {
+      cancelled = true;
+      channelReadyRef.current = false;
       window.clearInterval(waitForEcho);
       ac.abort();
       pollStopRef.current?.();

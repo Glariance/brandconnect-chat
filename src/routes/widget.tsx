@@ -25,7 +25,7 @@ import {
   type EchoLike,
   type RealtimeStatus,
 } from "@/lib/echo-client";
-import { drainCatchUpAfter } from "@/lib/catch-up";
+import { drainCatchUpAfter, HttpSyncWatermark } from "@/lib/catch-up";
 import { isVisitorAuthExpired, latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
 import { createSafeStorage, storagePersistenceNotice, type SafeStorage } from "@/lib/safe-storage";
 
@@ -128,10 +128,12 @@ function RealWidget() {
   const tokenRef = useRef<string | null>(null);
   const convRef = useRef<string | null>(null);
   const msgsRef = useRef<ApiMessage[]>([]);
+  const syncWatermarkRef = useRef(new HttpSyncWatermark());
   const bootAbortRef = useRef<AbortController | null>(null);
   const echoRef = useRef<EchoLike | null>(null);
   const subRef = useRef<ConversationSubscription | null>(null);
   const pollStopRef = useRef<(() => void) | null>(null);
+  const channelReadyRef = useRef(false);
   const genRef = useRef(0);
   const renewingRef = useRef(false);
 
@@ -148,6 +150,7 @@ function RealWidget() {
   }, []);
 
   const applyIncoming = useCallback((cid: string, incoming: ApiMessage[]) => {
+    // Echo / display merge only — does not advance HTTP sync watermark.
     if (convRef.current !== cid) return;
     setMsgs((prev) => {
       const merged = mergeMessages(prev, incoming);
@@ -159,17 +162,19 @@ function RealWidget() {
     bumpPending();
   }, []);
 
-  const runCatchUp = useCallback(async (cid: string, tokenValue: string, signal?: AbortSignal) => {
-    const afterId = latestServerId(msgsRef.current);
+  const runCatchUp = useCallback(async (cid: string, tokenValue: string, signal?: AbortSignal): Promise<{ complete: boolean }> => {
+    const afterId = syncWatermarkRef.current.current;
     if (afterId == null) {
       try {
         const page = await fetchVisitorMessages(tokenValue, cid, {}, { signal });
-        if (convRef.current !== cid) return;
+        if (convRef.current !== cid) return { complete: false };
         applyIncoming(cid, page.data);
+        syncWatermarkRef.current.reset(latestServerId(page.data));
+        return { complete: true };
       } catch (e) {
         if (!isAbortError(e)) await handleApiFailureRef.current?.(e);
+        return { complete: false };
       }
-      return;
     }
     const result = await drainCatchUpAfter(
       afterId,
@@ -182,8 +187,10 @@ function RealWidget() {
         },
       },
     );
-    if (convRef.current !== cid) return;
+    if (convRef.current !== cid) return { complete: false };
+    syncWatermarkRef.current.advanceFromHttp(result.confirmedThroughId);
     if (result.messages.length) applyIncoming(cid, result.messages);
+    return { complete: result.complete };
   }, [applyIncoming]);
 
   const handleApiFailureRef = useRef<((e: unknown) => Promise<void>) | null>(null);
@@ -217,6 +224,7 @@ function RealWidget() {
     const page = await fetchVisitorMessages(sessionToken, convId, {}, { signal });
     setMsgs(page.data);
     setOlderCursor(page.nextCursor);
+    syncWatermarkRef.current.reset(latestServerId(page.data));
     return { token: sessionToken, conversationId: convId };
   }, [clearVisitorIdentity]);
 
@@ -226,6 +234,7 @@ function RealWidget() {
     setError(`${reason} Starting a new anonymous session…`);
     pollStopRef.current?.();
     pollStopRef.current = null;
+    channelReadyRef.current = false;
     subRef.current?.leave();
     subRef.current = null;
     disconnectEcho(echoRef.current);
@@ -234,6 +243,7 @@ function RealWidget() {
     pendingRef.current.clearAll();
     setMsgs([]);
     setOlderCursor(null);
+    syncWatermarkRef.current.reset(undefined);
     setRealtime("connecting");
     try {
       const ac = new AbortController();
@@ -302,14 +312,29 @@ function RealWidget() {
     const cid = conversationId;
     const t = token;
     setRealtime("connecting");
+    channelReadyRef.current = false;
+
+    const stopPollingAfterRecovery = () => {
+      pollStopRef.current?.();
+      pollStopRef.current = null;
+    };
 
     const startPollingFallback = () => {
       if (cancelled || convRef.current !== cid) return;
-      pollStopRef.current?.();
       setRealtime("polling");
-      pollStopRef.current = startBoundedMessagePolling(() => {
-        if (convRef.current !== cid || tokenRef.current !== t) return;
-        void runCatchUp(cid, t).catch((e) => void handleApiFailure(e));
+      if (pollStopRef.current) return;
+      pollStopRef.current = startBoundedMessagePolling(async () => {
+        if (cancelled || convRef.current !== cid || tokenRef.current !== t) return;
+        try {
+          const { complete } = await runCatchUp(cid, t);
+          if (cancelled || convRef.current !== cid) return;
+          if (complete && channelReadyRef.current) {
+            stopPollingAfterRecovery();
+            setRealtime("live");
+          }
+        } catch (e) {
+          void handleApiFailure(e);
+        }
       }, 3000);
     };
 
@@ -326,19 +351,39 @@ function RealWidget() {
           return;
         }
         subRef.current?.leave();
+        channelReadyRef.current = false;
         subRef.current = subscribeToConversation(echo, cid, {
           onMessage: (msg) => applyIncoming(cid, [msg]),
           onSubscribed: () => {
             if (cancelled || !subRef.current?.active || convRef.current !== cid) return;
-            pollStopRef.current?.();
-            pollStopRef.current = null;
-            setRealtime("live");
-            void runCatchUp(cid, t).catch((e) => void handleApiFailure(e));
+            channelReadyRef.current = true;
+            void (async () => {
+              try {
+                const { complete } = await runCatchUp(cid, t);
+                if (cancelled || !subRef.current?.active || convRef.current !== cid) return;
+                if (complete) {
+                  stopPollingAfterRecovery();
+                  setRealtime("live");
+                } else {
+                  startPollingFallback();
+                }
+              } catch (e) {
+                void handleApiFailure(e);
+                if (!cancelled) startPollingFallback();
+              }
+            })();
           },
           onSubscriptionError: () => {
             if (cancelled || convRef.current !== cid) return;
+            channelReadyRef.current = false;
             startPollingFallback();
           },
+          onConnectionLost: () => {
+            if (cancelled || convRef.current !== cid) return;
+            channelReadyRef.current = false;
+            startPollingFallback();
+          },
+          subscriptionTimeoutMs: 10_000,
         });
       })
       .catch(() => {
@@ -347,6 +392,7 @@ function RealWidget() {
 
     return () => {
       cancelled = true;
+      channelReadyRef.current = false;
       pollStopRef.current?.();
       pollStopRef.current = null;
       subRef.current?.leave();
