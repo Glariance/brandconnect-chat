@@ -4,6 +4,7 @@ namespace App\Models;
 
 use App\Enums\ConversationStatus;
 use App\Enums\SenderType;
+use App\Events\InboxConversationUpdated;
 use App\Events\MessageCreated;
 use Database\Factories\ConversationFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
@@ -100,6 +101,8 @@ class Conversation extends Model
                 $message = DB::transaction(fn (): Message => $this->createMessage($sender, $clientMessageId, $body));
 
                 MessageCreated::dispatch($message);
+                // Inbox summary for agents; skipped on duplicate client_message_id retries.
+                InboxConversationUpdated::dispatch($this->fresh(['visitor']) ?? $this, InboxConversationUpdated::REASON_MESSAGE);
 
                 return [$message, true];
             } catch (UniqueConstraintViolationException) {

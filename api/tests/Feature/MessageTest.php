@@ -4,6 +4,7 @@ namespace Tests\Feature;
 
 use App\Enums\ConversationStatus;
 use App\Enums\SenderType;
+use App\Events\InboxConversationUpdated;
 use App\Events\MessageCreated;
 use App\Models\Brand;
 use App\Models\Conversation;
@@ -66,7 +67,7 @@ class MessageTest extends TestCase
 
     public function test_duplicate_client_message_id_retry_returns_the_original_message(): void
     {
-        Event::fake([MessageCreated::class]);
+        Event::fake([MessageCreated::class, InboxConversationUpdated::class]);
 
         $visitor = Visitor::factory()->create();
         $conversation = Conversation::factory()->forVisitor($visitor)->create();
@@ -89,6 +90,7 @@ class MessageTest extends TestCase
 
         $this->assertSame(1, $conversation->messages()->count());
         Event::assertDispatchedTimes(MessageCreated::class, 1);
+        Event::assertDispatchedTimes(InboxConversationUpdated::class, 1);
     }
 
     public function test_client_message_id_reused_by_a_different_sender_is_rejected(): void

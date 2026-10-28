@@ -118,6 +118,37 @@ export function createVisitorEcho(token: string): Promise<EchoLike | null> {
   return createEcho("visitor", token).catch(() => null);
 }
 
+/** Ref-counted shared agent Echo so inbox + conversation cleanup cannot orphan each other. */
+let sharedAgentEcho: EchoLike | null = null;
+let sharedAgentPromise: Promise<EchoLike | null> | null = null;
+let sharedAgentRefs = 0;
+
+export async function acquireAgentEcho(): Promise<EchoLike | null> {
+  sharedAgentRefs += 1;
+  if (!sharedAgentPromise) {
+    sharedAgentPromise = createAgentEcho().then((echo) => {
+      sharedAgentEcho = echo;
+      return echo;
+    });
+  }
+  return sharedAgentPromise;
+}
+
+export function releaseAgentEcho(): void {
+  sharedAgentRefs = Math.max(0, sharedAgentRefs - 1);
+  if (sharedAgentRefs > 0) return;
+  disconnectEcho(sharedAgentEcho);
+  sharedAgentEcho = null;
+  sharedAgentPromise = null;
+}
+
+/** Test helper — resets shared agent Echo bookkeeping. */
+export function __resetSharedAgentEchoForTests(): void {
+  sharedAgentEcho = null;
+  sharedAgentPromise = null;
+  sharedAgentRefs = 0;
+}
+
 export type ConversationSubscription = {
   leave: () => void;
   /** Whether leave() has already been called. */
@@ -161,6 +192,8 @@ export function subscribeToConversation(
 
   channel.listen(".message.created", handler);
 
+  let subTimeout: number | null = null;
+
   const clearSubTimeout = () => {
     if (subTimeout != null) {
       window.clearTimeout(subTimeout);
@@ -178,9 +211,6 @@ export function subscribeToConversation(
     if (!active) return;
     handlers.onSubscriptionError?.(err);
   };
-
-  channel.subscribed?.(onSubscribed);
-  channel.error?.(onError);
 
   const onConnected = () => {
     if (!active) return;
@@ -204,11 +234,15 @@ export function subscribeToConversation(
     connection?.bind(event, fn);
   }
 
-  let subTimeout: number | null = window.setTimeout(() => {
+  subTimeout = window.setTimeout(() => {
     subTimeout = null;
     if (!active || subscribedOnce) return;
     onConnectionLost("timeout");
   }, timeoutMs);
+
+  // Register after timeout is initialized so sync subscribed() callbacks are safe.
+  channel.subscribed?.(onSubscribed);
+  channel.error?.(onError);
 
   return {
     get active() {
@@ -251,6 +285,129 @@ export function disconnectEcho(echo: EchoLike | null | undefined): void {
   } catch {
     /* ignore */
   }
+}
+
+export type InboxSubscription = {
+  leave: () => void;
+  get active(): boolean;
+  get brandId(): number;
+};
+
+export type InboxSubscribeHandlers = {
+  onSummary: (payload: unknown) => void;
+  onSubscribed?: () => void;
+  onSubscriptionError?: (error: unknown) => void;
+  onConnectionLost?: (reason: ConnectionLostReason) => void;
+  subscriptionTimeoutMs?: number | undefined;
+};
+
+/**
+ * Subscribe to private-brands.{brandId}.inbox / .inbox.conversation.updated.
+ * Does not disconnect the shared Echo instance — only leaves this channel.
+ */
+export function subscribeToBrandInbox(
+  echo: EchoLike,
+  brandId: number,
+  handlers: InboxSubscribeHandlers,
+): InboxSubscription {
+  let active = true;
+  let subscribedOnce = false;
+  const channelName = `brands.${brandId}.inbox`;
+  const channel = echo.private(channelName);
+  const connection = echo.connector?.pusher?.connection;
+  const timeoutMs = handlers.subscriptionTimeoutMs ?? 10_000;
+
+  const handler = (payload: unknown) => {
+    if (!active) return;
+    handlers.onSummary(payload);
+  };
+
+  channel.listen(".inbox.conversation.updated", handler);
+
+  let subTimeout: number | null = null;
+
+  const clearSubTimeout = () => {
+    if (subTimeout != null) {
+      window.clearTimeout(subTimeout);
+      subTimeout = null;
+    }
+  };
+
+  const onSubscribed = () => {
+    if (!active) return;
+    subscribedOnce = true;
+    clearSubTimeout();
+    handlers.onSubscribed?.();
+  };
+  const onError = (err: unknown) => {
+    if (!active) return;
+    handlers.onSubscriptionError?.(err);
+  };
+
+  const onConnected = () => {
+    if (!active) return;
+    if (typeof channel.subscribed !== "function") {
+      onSubscribed();
+    }
+  };
+
+  const onConnectionLost = (reason: ConnectionLostReason) => {
+    if (!active) return;
+    handlers.onConnectionLost?.(reason);
+  };
+
+  connection?.bind("connected", onConnected);
+  const lostHandlers: Array<[ConnectionLostReason, (...args: unknown[]) => void]> = [];
+  for (const event of CONNECTION_LOST_EVENTS) {
+    const fn = () => onConnectionLost(event);
+    lostHandlers.push([event, fn]);
+    connection?.bind(event, fn);
+  }
+
+  subTimeout = window.setTimeout(() => {
+    subTimeout = null;
+    if (!active || subscribedOnce) return;
+    onConnectionLost("timeout");
+  }, timeoutMs);
+
+  channel.subscribed?.(onSubscribed);
+  channel.error?.(onError);
+
+  return {
+    get active() {
+      return active;
+    },
+    get brandId() {
+      return brandId;
+    },
+    leave: () => {
+      if (!active) return;
+      active = false;
+      clearSubTimeout();
+      try {
+        channel.stopListening(".inbox.conversation.updated");
+      } catch {
+        /* ignore */
+      }
+      try {
+        echo.leave(channelName);
+      } catch {
+        /* ignore */
+      }
+      try {
+        connection?.unbind("connected", onConnected);
+      } catch {
+        /* ignore */
+      }
+      for (const [event, fn] of lostHandlers) {
+        try {
+          connection?.unbind(event, fn);
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+  };
 }
 
 /**

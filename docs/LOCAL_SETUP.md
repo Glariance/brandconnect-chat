@@ -56,16 +56,22 @@ A second `npm run dev:all` while the first is alive refuses to start (`.dev-all.
 
 ## Realtime behavior (current)
 
-- **Conversation messages (agent + visitor):** Laravel Echo subscribes to `private-conversations.{id}` and listens for `.message.created` when `VITE_REVERB_APP_KEY` is set and Reverb is reachable. Echo is created **browser-only** (dynamic import) so TanStack SSR is unaffected.
+- **Conversation messages (agent + visitor):** Laravel Echo subscribes to `private-conversations.{id}` and listens for `.message.created` when `VITE_REVERB_APP_KEY` is set and Reverb is reachable. Echo is created **browser-only** (dynamic import) so TanStack SSR is unaffected. Dashboard agents share a **ref-counted** Echo instance (`acquireAgentEcho` / `releaseAgentEcho`) so one component’s cleanup does not disconnect another active subscription.
 - **Auth:**
   - Dashboard Echo auth uses Sanctum session cookies + `X-XSRF-TOKEN` against `/broadcasting/auth` (`credentials: include`).
   - Widget Echo auth uses the visitor Bearer token against `/api/v1/widget/broadcasting/auth` with **cookies omitted**.
 - **Reconnect / catch-up:** after **private-channel subscription** succeeds (not merely socket `connected`), the client HTTP-fetches with `after_id` from an HTTP-only watermark and merges by server id. Echo arrivals do not advance that watermark.
-- **Inbox list:**
-  - Existing conversation **previews** update immediately from authorized `.message.created` events on the active subscription.
-  - The list still **HTTP-polls ~5s** because discovering **entirely new** conversations needs a dedicated authorized inbox/notification channel (not implemented yet).
-- **Fallback:** if Reverb/Echo is unavailable, UI shows `Realtime unavailable · polling` and message catch-up uses bounded HTTP. Sending does not depend on Echo.
-- **Queue:** `MessageCreated` implements `ShouldBroadcast` and is queued — without `queue:work`, jobs sit in `jobs` and **no WebSocket frames are published**. Prefer `--sleep=1` locally to reduce idle delay after enqueue.
+- **Inbox discovery (agents):**
+  - Channel: `private-brands.{brandId}.inbox` (Echo name `brands.{brandId}.inbox`).
+  - Event: `.inbox.conversation.updated` (`InboxConversationUpdated`), queued after DB commit.
+  - Payload (minimal): `conversation.id`, `brand_id`, `status`, safe `visitor_name`, `page`, `last_message_preview`, `last_message_at`, `updated_at`, `version`, plus `reason` (`created` | `message` | `status`). No visitor tokens, no actor-specific `unread_count`, no message bodies.
+  - Authorization: `BrandPolicy::view` / `User::canAccessBrand` on the **web** guard only. Guests, visitor bearer credentials, unassigned agents, and other-organization users are denied. Organization membership alone does **not** grant agent brand access.
+  - Frontend subscribes only to brand IDs returned by `GET /api/v1/brands`, including **All brands** (one channel per authorized brand). List rows merge/reorder/remove by active status + brand filters; stale `version` values are rejected; selection/draft/pending sends are preserved; agents are **not** auto-switched to new conversations.
+  - Unread counts stay authoritative on the server via debounced HTTP list reconcile (not invented from fan-out events).
+  - Message bodies still use `private-conversations.{id}` / `.message.created`. Duplicate `client_message_id` retries do **not** re-dispatch inbox notifications.
+- **Fallback:** HTTP remains the authoritative initial list and reconciliation source. Routine **~5s inbox list polling** runs until **all required inbox subscriptions are healthy and reconciliation has completed**; it resumes (non-overlapping) on subscribe failure, timeout, or disconnect. Message catch-up uses the existing bounded HTTP pattern. Sending does not depend on Echo.
+- **Access revocation:** Laravel does **not** re-authorize every published event on an already-subscribed private channel. Strategy: refresh authorized brands after reconnect / brand-filter change and `leave` channels missing from `GET /api/v1/brands`; treat list/API **403** as revocation and drop inbox subscriptions + restore polling.
+- **Queue:** `MessageCreated` and `InboxConversationUpdated` implement `ShouldBroadcast` + `ShouldDispatchAfterCommit` and are queued — without `queue:work`, jobs sit in `jobs` and **no WebSocket frames are published**. Prefer `--sleep=1` locally to reduce idle delay after enqueue.
 
 ### If the UI shows “Realtime unavailable · polling”
 
@@ -75,11 +81,18 @@ Diagnose stages in order (do not only shorten poll intervals):
 2. **Process:** something must listen on **8081** (`php artisan reverb:start`). Queue worker must be running. After env changes: `php artisan config:clear`, then restart frontend, Reverb, and the worker.
 3. **WebSocket handshake:** Upgrade to Reverb `/app/{key}` returns **HTTP 101**.
 4. **Auth:** agent `POST /broadcasting/auth` (cookies + CSRF); visitor `POST /api/v1/widget/broadcasting/auth` (Bearer, cookies omitted).
-5. **Subscribe:** private `conversations.{id}` succeeds.
-6. **Queue:** `MessageCreated` leaves `jobs` (check `failed_jobs` before deleting anything).
-7. **Delivery:** receiving browser gets a `.message.created` **WebSocket frame** (not only an HTTP poll).
+5. **Subscribe:** private `conversations.{id}` and/or `brands.{brandId}.inbox` succeed.
+6. **Queue:** broadcast jobs leave `jobs` (check `failed_jobs` before deleting anything).
+7. **Delivery:** receiving browser gets a `.message.created` or `.inbox.conversation.updated` **WebSocket frame** (not only an HTTP poll).
 
 Local check helper (no secrets printed): `node scripts/verify-reverb-delivery.mjs`
+
+### Manual acceptance (inbox discovery)
+
+1. Open an agent `/inbox` session and a separate visitor browser (widget demo).
+2. Start a **new** visitor conversation.
+3. Confirm the inbox row appears via the brand inbox WebSocket event **without** waiting for the ~5s list poll.
+4. Confirm messaging on an existing conversation still works over `conversations.{id}`.
 
 ## Prerequisites
 

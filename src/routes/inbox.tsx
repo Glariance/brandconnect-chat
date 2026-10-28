@@ -7,27 +7,38 @@ import { addMessage, closeConv, markRead, now, useLiveChats } from "@/lib/chat-s
 import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
 import {
   fetchAgentMessages,
+  fetchBrands,
   fetchConversations,
   formatMsgTime,
   markConversationRead,
   newClientMessageId,
   patchConversationStatus,
   postAgentMessage,
+  type ApiBrand,
   type ApiConversation,
   type ApiMessage,
 } from "@/lib/chat-api";
 import {
-  createAgentEcho,
-  disconnectEcho,
+  acquireAgentEcho,
   realtimeStatusLabel,
+  releaseAgentEcho,
   startBoundedMessagePolling,
+  subscribeToBrandInbox,
   subscribeToConversation,
   type ConversationSubscription,
   type EchoLike,
+  type InboxSubscription,
   type RealtimeStatus,
 } from "@/lib/echo-client";
 import { drainCatchUpAfter, HttpSyncWatermark } from "@/lib/catch-up";
 import { latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
+import { parseBrandFilterId, useBrandFilter } from "@/lib/brand-filter";
+import {
+  applyInboxSummary,
+  inboxSummaryFromBroadcast,
+  mergeInboxLists,
+  type InboxListFilters,
+} from "@/lib/inbox-utils";
 
 export const Route = createFileRoute("/inbox")({
   head: () => ({
@@ -96,6 +107,8 @@ function DemoInbox() {
 }
 
 function RealInbox() {
+  const { brandId: brandFilterRaw, brands: shellBrands } = useBrandFilter();
+  const brandFilter = parseBrandFilterId(brandFilterRaw);
   const [tab, setTab] = useState<"open" | "pending" | "closed">("open");
   const [active, setActive] = useState<string | null>(null);
   const [rows, setRows] = useState<ApiConversation[]>([]);
@@ -108,26 +121,44 @@ function RealInbox() {
   const [sending, setSending] = useState(false);
   const [pendingTick, setPendingTick] = useState(0);
   const [realtime, setRealtime] = useState<RealtimeStatus>("connecting");
+  const [authorizedBrands, setAuthorizedBrands] = useState<ApiBrand[]>(shellBrands);
 
   const pendingRef = useRef(new PendingSendRegistry());
   const draftsRef = useRef(new Map<string, string>());
   const activeRef = useRef<string | null>(null);
   const msgsRef = useRef<ApiMessage[]>([]);
+  const rowsRef = useRef<ApiConversation[]>([]);
   const syncWatermarkRef = useRef(new HttpSyncWatermark());
   const listAbortRef = useRef<AbortController | null>(null);
   const msgsAbortRef = useRef<AbortController | null>(null);
   const echoRef = useRef<EchoLike | null>(null);
   const echoReadyRef = useRef(false);
   const subRef = useRef<ConversationSubscription | null>(null);
+  const inboxSubsRef = useRef<InboxSubscription[]>([]);
   const pollStopRef = useRef<(() => void) | null>(null);
+  const listPollStopRef = useRef<(() => void) | null>(null);
   /** True only between channel.subscribed and connection-lost / leave. */
   const channelReadyRef = useRef(false);
+  const inboxHealthyRef = useRef(false);
+  const inboxReconciledRef = useRef(false);
+  const subscribedBrandIdsRef = useRef(new Set<number>());
+  const expectedBrandIdsRef = useRef<number[]>([]);
+  const unreadReconcileTimerRef = useRef<number | null>(null);
   const convGenRef = useRef(0);
+  const filtersRef = useRef<InboxListFilters>({ status: tab, brandId: brandFilter });
 
   activeRef.current = active;
   msgsRef.current = msgs;
+  rowsRef.current = rows;
+  filtersRef.current = { status: tab, brandId: brandFilter };
 
   const bumpPending = () => setPendingTick((n) => n + 1);
+
+  const brandNameById = useCallback(() => {
+    const map = new Map<number, string>();
+    for (const b of authorizedBrands) map.set(b.id, b.name);
+    return map;
+  }, [authorizedBrands]);
 
   /** Patch inbox row previews from authorized message events (does not discover new conversations). */
   const applyConversationPreview = useCallback((incoming: ApiMessage[]) => {
@@ -214,65 +245,246 @@ function RealInbox() {
     return { complete: result.complete };
   }, [applyIncoming]);
 
-  const loadList = useCallback(async () => {
+  const listParams = useCallback(() => {
+    const params: { status: string; brand_id?: number } = { status: filtersRef.current.status };
+    if (filtersRef.current.brandId !== "all") params.brand_id = filtersRef.current.brandId;
+    return params;
+  }, []);
+
+  const loadList = useCallback(async (opts?: { mergeLive?: boolean }) => {
     listAbortRef.current?.abort();
     const ac = new AbortController();
     listAbortRef.current = ac;
+    const filters = { ...filtersRef.current };
     try {
-      const list = await fetchConversations({ status: tab }, { signal: ac.signal });
-      setRows(list);
-      setActive((prev) => (prev && list.some((c) => c.id === prev) ? prev : list[0]?.id ?? null));
+      const list = await fetchConversations(listParams(), { signal: ac.signal });
+      if (ac.signal.aborted) return;
+      setRows((prev) => (opts?.mergeLive ? mergeInboxLists(list, prev, filters) : mergeInboxLists(list, [], filters)));
+      // Never auto-switch to a newly discovered conversation; only seed when empty.
+      setActive((prev) => prev ?? list[0]?.id ?? null);
+      setError(null);
+      return true;
     } catch (e) {
-      if (isAbortError(e)) return;
+      if (isAbortError(e)) return false;
+      if (e instanceof ApiError && e.status === 403) {
+        // Access revocation: drop inbox channels and fall back to polling.
+        for (const sub of inboxSubsRef.current) sub.leave();
+        inboxSubsRef.current = [];
+        subscribedBrandIdsRef.current.clear();
+        inboxHealthyRef.current = false;
+      }
       setError(e instanceof ApiError ? e.message : "Failed to load conversations");
-      setRows([]);
+      if (!opts?.mergeLive) setRows([]);
+      return false;
     } finally {
       setLoading(false);
     }
-  }, [tab]);
+  }, [listParams]);
+
+  const stopListPolling = useCallback(() => {
+    listPollStopRef.current?.();
+    listPollStopRef.current = null;
+  }, []);
+
+  const startListPolling = useCallback(() => {
+    if (listPollStopRef.current) return;
+    listPollStopRef.current = startBoundedMessagePolling(() => {
+      void loadList({ mergeLive: true });
+    }, 5000);
+  }, [loadList]);
+
+  const maybeStopListPolling = useCallback(() => {
+    const expected = expectedBrandIdsRef.current;
+    const allSubscribed =
+      expected.length > 0
+      && expected.every((id) => subscribedBrandIdsRef.current.has(id));
+    if (allSubscribed && inboxReconciledRef.current) {
+      inboxHealthyRef.current = true;
+      stopListPolling();
+      setRealtime((s) => (s === "polling" || s === "connecting" ? "live" : s));
+    }
+  }, [stopListPolling]);
+
+  const scheduleUnreadReconcile = useCallback(() => {
+    if (unreadReconcileTimerRef.current != null) window.clearTimeout(unreadReconcileTimerRef.current);
+    unreadReconcileTimerRef.current = window.setTimeout(() => {
+      unreadReconcileTimerRef.current = null;
+      void loadList({ mergeLive: true });
+    }, 800);
+  }, [loadList]);
+
+  const onInboxPayload = useCallback((payload: unknown) => {
+    const summary = inboxSummaryFromBroadcast(payload);
+    if (!summary) return;
+    setRows((prev) => applyInboxSummary(prev, summary, filtersRef.current, brandNameById()));
+    // Do not change active selection when a new conversation arrives.
+    scheduleUnreadReconcile();
+  }, [brandNameById, scheduleUnreadReconcile]);
 
   useEffect(() => {
     setLoading(true);
-    void loadList();
-    // Keep inbox-list polling until new-conversation notifications exist.
-    const t = window.setInterval(() => void loadList(), 5000);
+    inboxReconciledRef.current = false;
+    void loadList({ mergeLive: false }).then((ok) => {
+      if (ok) {
+        inboxReconciledRef.current = true;
+        maybeStopListPolling();
+      }
+    });
+    // Discovery polling until inbox subscriptions are healthy + reconciled.
+    startListPolling();
     return () => {
-      window.clearInterval(t);
       listAbortRef.current?.abort();
+      stopListPolling();
     };
-  }, [loadList]);
+  }, [tab, brandFilter, loadList, startListPolling, stopListPolling, maybeStopListPolling]);
 
   useEffect(() => {
     let cancelled = false;
     setRealtime("connecting");
-    void createAgentEcho()
+    echoReadyRef.current = false;
+    void acquireAgentEcho()
       .then((echo) => {
         if (cancelled) {
-          disconnectEcho(echo);
+          releaseAgentEcho();
           return;
         }
         echoRef.current = echo;
         echoReadyRef.current = true;
         setRealtime(echo ? "connecting" : "polling");
+        if (!echo) startListPolling();
       })
       .catch(() => {
         if (cancelled) return;
         echoRef.current = null;
         echoReadyRef.current = true;
         setRealtime("polling");
+        startListPolling();
       });
     return () => {
       cancelled = true;
       pollStopRef.current?.();
       pollStopRef.current = null;
+      stopListPolling();
+      if (unreadReconcileTimerRef.current != null) {
+        window.clearTimeout(unreadReconcileTimerRef.current);
+        unreadReconcileTimerRef.current = null;
+      }
+      for (const sub of inboxSubsRef.current) sub.leave();
+      inboxSubsRef.current = [];
+      subscribedBrandIdsRef.current.clear();
+      inboxHealthyRef.current = false;
       subRef.current?.leave();
       subRef.current = null;
-      disconnectEcho(echoRef.current);
+      releaseAgentEcho();
       echoRef.current = null;
+      echoReadyRef.current = false;
       // Logout/unmount identity reset
       pendingRef.current.clearAll();
     };
-  }, []);
+  }, [startListPolling, stopListPolling]);
+
+  // Brand inbox subscriptions — only brands from the authorized brands API.
+  useEffect(() => {
+    let cancelled = false;
+    let brandsAbort: AbortController | null = null;
+
+    const leaveInboxSubs = () => {
+      for (const sub of inboxSubsRef.current) sub.leave();
+      inboxSubsRef.current = [];
+      subscribedBrandIdsRef.current.clear();
+      inboxHealthyRef.current = false;
+    };
+
+    const attachInbox = async () => {
+      while (!cancelled && !echoReadyRef.current) {
+        await new Promise((r) => window.setTimeout(r, 50));
+      }
+      if (cancelled) return;
+      const echo = echoRef.current;
+      if (!echo) {
+        startListPolling();
+        setRealtime("polling");
+        return;
+      }
+
+      brandsAbort = new AbortController();
+      let brands: ApiBrand[];
+      try {
+        brands = await fetchBrands({ signal: brandsAbort.signal });
+      } catch (e) {
+        if (isAbortError(e) || cancelled) return;
+        startListPolling();
+        setRealtime("polling");
+        return;
+      }
+      if (cancelled) return;
+      setAuthorizedBrands(brands);
+
+      const allIds = brands.map((b) => b.id);
+      const targetIds =
+        brandFilter === "all"
+          ? allIds
+          : allIds.includes(brandFilter)
+            ? [brandFilter]
+            : [];
+
+      // Revocation / brand change: leave channels no longer authorized.
+      leaveInboxSubs();
+      expectedBrandIdsRef.current = targetIds;
+      inboxReconciledRef.current = false;
+
+      if (targetIds.length === 0) {
+        startListPolling();
+        void loadList({ mergeLive: true }).then((ok) => {
+          if (ok) inboxReconciledRef.current = true;
+        });
+        return;
+      }
+
+      const markSubscribed = (id: number) => {
+        subscribedBrandIdsRef.current.add(id);
+        maybeStopListPolling();
+      };
+
+      const onInboxDown = () => {
+        inboxHealthyRef.current = false;
+        startListPolling();
+        setRealtime("polling");
+      };
+
+      for (const id of targetIds) {
+        const sub = subscribeToBrandInbox(echo, id, {
+          onSummary: onInboxPayload,
+          onSubscribed: () => {
+            if (cancelled || !sub.active) return;
+            markSubscribed(id);
+            void (async () => {
+              const ok = await loadList({ mergeLive: true });
+              if (cancelled || !sub.active) return;
+              if (ok) {
+                inboxReconciledRef.current = true;
+                maybeStopListPolling();
+              } else {
+                onInboxDown();
+              }
+            })();
+          },
+          onSubscriptionError: onInboxDown,
+          onConnectionLost: onInboxDown,
+          subscriptionTimeoutMs: 10_000,
+        });
+        inboxSubsRef.current.push(sub);
+      }
+    };
+
+    void attachInbox();
+
+    return () => {
+      cancelled = true;
+      brandsAbort?.abort();
+      leaveInboxSubs();
+    };
+  }, [brandFilter, loadList, maybeStopListPolling, onInboxPayload, startListPolling]);
 
   useEffect(() => {
     msgsAbortRef.current?.abort();

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api\V1\Widget;
 
 use App\Enums\ConversationStatus;
+use App\Events\InboxConversationUpdated;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\Widget\StoreVisitorConversationRequest;
 use App\Http\Resources\ConversationResource;
@@ -33,6 +34,13 @@ class ConversationController extends Controller
             'page' => $request->validated('page'),
             'last_message_at' => now(),
         ]);
+
+        if ($wasCreated) {
+            InboxConversationUpdated::dispatch(
+                $conversation->fresh(['visitor']) ?? $conversation,
+                InboxConversationUpdated::REASON_CREATED,
+            );
+        }
 
         $conversation = Conversation::query()
             ->whereKey($conversation->getKey())

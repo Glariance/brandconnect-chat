@@ -8,6 +8,7 @@ import { brands as sampleBrands } from "@/lib/sample-data";
 import { useAuth } from "@/lib/auth";
 import { ApiError, isRealChatEnabled } from "@/lib/api";
 import { fetchBrands, type ApiBrand } from "@/lib/chat-api";
+import { BrandFilterProvider } from "@/lib/brand-filter";
 
 export const nav = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
@@ -60,6 +61,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   };
 
   return (
+    <BrandFilterProvider value={{ brandId: brand, setBrandId: setBrand, brands: apiBrands }}>
     <div className="flex min-h-screen bg-background">
       <aside
         className={`fixed inset-y-0 left-0 z-40 w-60 shrink-0 bg-sidebar text-sidebar-foreground transition-transform lg:static lg:translate-x-0 ${open ? "translate-x-0" : "-translate-x-full"}`}
@@ -135,6 +137,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <main className="flex-1 p-4 md:p-6">{children}</main>
       </div>
     </div>
+    </BrandFilterProvider>
   );
 }
 

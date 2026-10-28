@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api\V1;
 
+use App\Events\InboxConversationUpdated;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Api\V1\IndexConversationsRequest;
 use App\Http\Requests\Api\V1\UpdateConversationRequest;
@@ -50,6 +51,11 @@ class ConversationController extends Controller
     public function update(UpdateConversationRequest $request, Conversation $conversation): ConversationResource
     {
         $conversation->update(['status' => $request->validated('status')]);
+
+        InboxConversationUpdated::dispatch(
+            $conversation->fresh(['visitor']) ?? $conversation,
+            InboxConversationUpdated::REASON_STATUS,
+        );
 
         $conversation = Conversation::query()
             ->whereKey($conversation->getKey())
