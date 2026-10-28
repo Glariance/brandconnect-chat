@@ -7,7 +7,6 @@ import { addMessage, closeConv, markRead, now, useLiveChats } from "@/lib/chat-s
 import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
 import {
   fetchAgentMessages,
-  fetchBrands,
   fetchConversations,
   formatMsgTime,
   markConversationRead,
@@ -110,8 +109,6 @@ function RealInbox() {
   const [pendingTick, setPendingTick] = useState(0);
   const [realtime, setRealtime] = useState<RealtimeStatus>("connecting");
 
-  const [previewBrandId, setPreviewBrandId] = useState<string | null>(null);
-
   const pendingRef = useRef(new PendingSendRegistry());
   const draftsRef = useRef(new Map<string, string>());
   const activeRef = useRef<string | null>(null);
@@ -127,21 +124,36 @@ function RealInbox() {
   const channelReadyRef = useRef(false);
   const convGenRef = useRef(0);
 
-  useEffect(() => {
-    const ac = new AbortController();
-    void fetchBrands({ signal: ac.signal })
-      .then((list) => setPreviewBrandId(list[0]?.public_id ?? null))
-      .catch(() => setPreviewBrandId(null));
-    return () => ac.abort();
-  }, []);
-
   activeRef.current = active;
   msgsRef.current = msgs;
 
   const bumpPending = () => setPendingTick((n) => n + 1);
 
+  /** Patch inbox row previews from authorized message events (does not discover new conversations). */
+  const applyConversationPreview = useCallback((incoming: ApiMessage[]) => {
+    if (!incoming.length) return;
+    setRows((prev) => {
+      let changed = false;
+      const next = prev.map((row) => {
+        const latest = incoming.filter((m) => m.conversation_id === row.id).sort((a, b) => a.id - b.id).at(-1);
+        if (!latest) return row;
+        changed = true;
+        const isActive = activeRef.current === row.id;
+        return {
+          ...row,
+          last_message_preview: latest.body,
+          last_message_at: latest.created_at,
+          unread_count: isActive ? row.unread_count : (row.unread_count ?? 0) + 1,
+          updated_at: latest.created_at,
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
   const applyIncoming = useCallback((conversationId: string, incoming: ApiMessage[]) => {
     // Echo / display merge only — does not advance HTTP sync watermark.
+    applyConversationPreview(incoming);
     if (activeRef.current !== conversationId) return;
     setMsgs((prev) => {
       const merged = mergeMessages(prev, incoming);
@@ -151,7 +163,7 @@ function RealInbox() {
       return merged;
     });
     bumpPending();
-  }, []);
+  }, [applyConversationPreview]);
 
   const runCatchUp = useCallback(async (conversationId: string, signal?: AbortSignal): Promise<{ complete: boolean }> => {
     const gen = convGenRef.current;
@@ -450,11 +462,11 @@ function RealInbox() {
     try {
       const msg = await postAgentMessage(conversationId, pending.clientMessageId, text);
       pendingRef.current.confirm(conversationId, pending.clientMessageId);
+      applyConversationPreview([msg]);
       if (activeRef.current === conversationId) {
         setMsgs((prev) => mergeMessages(prev, [msg]));
         bumpPending();
       }
-      await loadList();
     } catch (e) {
       if (isAbortError(e)) return;
       pendingRef.current.markFailed(conversationId, pending.clientMessageId);
@@ -533,7 +545,11 @@ function RealInbox() {
           onClose={() => void onClose()}
           onLoadOlder={olderCursor ? () => void loadOlder() : undefined}
           loadingOlder={loadingOlder}
-          visitorPreviewBrandId={apiConv?.brand?.public_id ?? previewBrandId}
+          visitorPreviewBrandId={
+            apiConv?.brand?.public_id
+            ?? rows.find((c) => c.brand?.public_id)?.brand?.public_id
+            ?? null
+          }
           sideDetails={apiConv
             ? [["Source", "Chat widget"], ["Current page", apiConv.page ?? "/"], ["Brand", apiConv.brand?.name ?? String(apiConv.brand_id)], ["Messages", String(msgs.length)]]
             : [["Source", "—"]]}

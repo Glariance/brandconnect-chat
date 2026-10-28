@@ -25,17 +25,27 @@ export function isAbortError(error: unknown): boolean {
 }
 
 let csrfReady = false;
+/** Shared in-flight CSRF bootstrap so parallel /auth/me + /brands + /conversations do not triple-hit Sanctum. */
+let csrfPromise: Promise<void> | null = null;
 
 async function ensureCsrf(): Promise<void> {
   if (csrfReady) return;
-  const res = await fetch(`${API_URL}/sanctum/csrf-cookie`, {
-    method: "GET",
-    credentials: "include",
-  });
-  if (!res.ok) {
-    throw new ApiError(res.status, "Could not initialize CSRF cookie");
+  if (!csrfPromise) {
+    csrfPromise = (async () => {
+      const res = await fetch(`${API_URL}/sanctum/csrf-cookie`, {
+        method: "GET",
+        credentials: "include",
+      });
+      if (!res.ok) {
+        throw new ApiError(res.status, "Could not initialize CSRF cookie");
+      }
+      csrfReady = true;
+    })().catch((err) => {
+      csrfPromise = null;
+      throw err;
+    });
   }
-  csrfReady = true;
+  await csrfPromise;
 }
 
 export function xsrfToken(): string | null {
@@ -126,6 +136,7 @@ export function apiBaseUrl(): string {
 
 export function resetCsrf(): void {
   csrfReady = false;
+  csrfPromise = null;
 }
 
 export function reverbEnv() {

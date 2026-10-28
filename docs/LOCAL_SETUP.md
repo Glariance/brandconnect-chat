@@ -9,7 +9,7 @@ Milestone 1 uses the existing Laravel app in `api/` and the TanStack frontend at
 | Laravel API | **8000** | `cd api && php artisan serve --host=127.0.0.1 --port=8000` |
 | Frontend (Vite / Lovable) | **8080** | `npm run dev` (repo root) |
 | Laravel Reverb | **8081** | `cd api && php artisan reverb:start` |
-| Queue worker | — | `cd api && php artisan queue:work --tries=1` |
+| Queue worker | — | `cd api && php artisan queue:work --tries=1 --sleep=1` |
 
 Use the **same host style** everywhere (`localhost` *or* `127.0.0.1`). Mixing them breaks Sanctum cookies.
 
@@ -19,10 +19,26 @@ Use the **same host style** everywhere (`localhost` *or* `127.0.0.1`). Mixing th
 - **Auth:**
   - Dashboard Echo auth uses Sanctum session cookies + `X-XSRF-TOKEN` against `/broadcasting/auth` (`credentials: include`).
   - Widget Echo auth uses the visitor Bearer token against `/api/v1/widget/broadcasting/auth` with **cookies omitted**.
-- **Reconnect:** on websocket `connected`, the client HTTP-fetches messages with `after_id` and merges by server id (no duplicates).
-- **Inbox list:** still **HTTP-polled** (~5s) until a dedicated new-conversation notification channel exists.
-- **Fallback:** if Reverb/Echo is unavailable, message catch-up still works via HTTP (`after_id` / load-older cursors). Sending does not depend on Echo.
-- **Queue:** `MessageCreated` is queued — run `php artisan queue:work` or broadcasts will not leave the API.
+- **Reconnect / catch-up:** after **private-channel subscription** succeeds (not merely socket `connected`), the client HTTP-fetches with `after_id` from an HTTP-only watermark and merges by server id. Echo arrivals do not advance that watermark.
+- **Inbox list:**
+  - Existing conversation **previews** update immediately from authorized `.message.created` events on the active subscription.
+  - The list still **HTTP-polls ~5s** because discovering **entirely new** conversations needs a dedicated authorized inbox/notification channel (not implemented yet).
+- **Fallback:** if Reverb/Echo is unavailable, UI shows `Realtime unavailable · polling` and message catch-up uses bounded HTTP. Sending does not depend on Echo.
+- **Queue:** `MessageCreated` implements `ShouldBroadcast` and is queued — without `queue:work`, jobs sit in `jobs` and **no WebSocket frames are published**. Prefer `--sleep=1` locally to reduce idle delay after enqueue.
+
+### If the UI shows “Realtime unavailable · polling”
+
+Diagnose stages in order (do not only shorten poll intervals):
+
+1. **Env:** root `VITE_REVERB_APP_KEY` must equal `api` `REVERB_APP_KEY`. Host/port/scheme must match the running Reverb process (`REVERB_SERVER_PORT=8081`, frontend Vite on **8080**). `BROADCAST_CONNECTION=reverb`. Never expose `REVERB_APP_SECRET` via `VITE_*`.
+2. **Process:** something must listen on **8081** (`php artisan reverb:start`). Queue worker must be running. After env changes: `php artisan config:clear`, then restart frontend, Reverb, and the worker.
+3. **WebSocket handshake:** Upgrade to Reverb `/app/{key}` returns **HTTP 101**.
+4. **Auth:** agent `POST /broadcasting/auth` (cookies + CSRF); visitor `POST /api/v1/widget/broadcasting/auth` (Bearer, cookies omitted).
+5. **Subscribe:** private `conversations.{id}` succeeds.
+6. **Queue:** `MessageCreated` leaves `jobs` (check `failed_jobs` before deleting anything).
+7. **Delivery:** receiving browser gets a `.message.created` **WebSocket frame** (not only an HTTP poll).
+
+Local check helper (no secrets printed): `node scripts/verify-reverb-delivery.mjs`
 
 ## Prerequisites
 
@@ -93,12 +109,12 @@ cd api
 php artisan reverb:start
 
 cd api
-php artisan queue:work --tries=1
+php artisan queue:work --tries=1 --sleep=1
 
 cd (repo root)
 copy .env.example .env
 REM set VITE_API_URL=http://localhost:8000 and VITE_REAL_CHAT=true
-REM set VITE_REVERB_* to match api/.env (port 8081)
+REM set VITE_REVERB_* to match api/.env (port 8081) — never VITE_REVERB_APP_SECRET
 npm install
 npm run dev
 ```
@@ -115,6 +131,23 @@ VITE_REVERB_HOST=localhost
 VITE_REVERB_PORT=8081
 VITE_REVERB_SCHEME=http
 ```
+
+Do **not** add `VITE_REVERB_APP_SECRET` (or any other secret) to the frontend env.
+
+## Observed local timings (not a guarantee)
+
+On one local diagnose pass with Reverb + `queue:work --sleep=1` already running:
+
+| Stage | Observed |
+|-------|----------|
+| In-process CSRF + `/auth/me` + conversations + messages | ~184ms sum |
+| HTTP Sanctum CSRF (cold, via `artisan serve`) | ~0.7–1.0s |
+| WS handshake / socket connected | ~10–20ms once Reverb is up |
+| Visitor broadcasting auth | ~0.4–2.0s depending on `artisan serve` load |
+| `MessageCreated` queue job | ~230–300ms |
+| HTTP 201 → `.message.created` WS frame | ~0.5–0.6s in that run |
+
+`php artisan serve` is single-threaded; overlapping browser requests stretch wall-clock time. History HTTP loads do **not** wait for Echo subscription — transcript fetch starts as soon as a conversation is selected.
 
 ## Visitor storage note
 
