@@ -46,6 +46,20 @@ export type VisitorSession = {
   expires_at: string;
 };
 
+export type ApiLiveVisitor = {
+  visitor_id: number;
+  brand_id: number;
+  brand_name: string | null;
+  label: string;
+  page: string;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  status: "active" | "idle" | "offline";
+  chat_opened: boolean;
+  tab_count: number;
+  version: string;
+};
+
 export type CursorPage<T> = {
   data: T[];
   nextCursor: string | null;
@@ -180,6 +194,38 @@ export async function createVisitorSession(publicId: string, opts: RequestBase =
       signal: opts.signal,
     }),
   );
+}
+
+export async function postVisitorPresence(
+  token: string,
+  input: {
+    tab_id: string;
+    page?: string;
+    chat_opened?: boolean;
+    activity?: boolean;
+  },
+  opts: RequestBase = {},
+): Promise<ApiLiveVisitor> {
+  return unwrapOne(
+    await api("/widget/presence", {
+      method: "POST",
+      bearer: token,
+      body: input,
+      signal: opts.signal,
+    }),
+  );
+}
+
+export async function fetchLiveVisitors(
+  params: { brand_id?: number | string; cursor?: string } = {},
+  opts: RequestBase = {},
+): Promise<CursorPage<ApiLiveVisitor>> {
+  const q = new URLSearchParams();
+  if (params.brand_id) q.set("brand_id", String(params.brand_id));
+  if (params.cursor) q.set("cursor", params.cursor);
+  const qs = q.toString();
+  const payload = await api(`/live-visitors${qs ? `?${qs}` : ""}`, { signal: opts.signal });
+  return asCursorPage<ApiLiveVisitor>(payload);
 }
 
 export async function createVisitorConversation(

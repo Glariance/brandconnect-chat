@@ -66,6 +66,11 @@ class AppServiceProvider extends ServiceProvider
             return Limit::perMinute(10)->by($request->ip());
         });
 
+        // ~25s heartbeats + SPA page bumps; keep headroom for multi-tab.
+        RateLimiter::for('visitor-presence', function (Request $request): Limit {
+            return Limit::perMinute(30)->by($this->rateLimitKey($request));
+        });
+
         RateLimiter::for('messages', function (Request $request): Limit {
             return Limit::perMinute(30)->by($this->rateLimitKey($request));
         });

@@ -34,3 +34,12 @@ Broadcast::channel('conversations.{conversation}', function (User|Visitor $actor
 Broadcast::channel('brands.{brand}.inbox', function (?User $user, Brand $brand) {
     return $user instanceof User && Gate::forUser($user)->allows('view', $brand);
 }, ['guards' => ['web']]);
+
+/*
+| Live visitor presence is dashboard-only (same BrandPolicy as inbox).
+| Visitors/guests cannot subscribe. Revocation strategy matches inbox:
+| refresh authorized brands after reconnect; leave missing channels; treat API 403 as revocation.
+*/
+Broadcast::channel('brands.{brand}.presence', function (?User $user, Brand $brand) {
+    return $user instanceof User && Gate::forUser($user)->allows('view', $brand);
+}, ['guards' => ['web']]);

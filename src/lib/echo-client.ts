@@ -287,10 +287,21 @@ export function disconnectEcho(echo: EchoLike | null | undefined): void {
   }
 }
 
-export type InboxSubscription = {
+export type BrandChannelSubscription = {
   leave: () => void;
   get active(): boolean;
   get brandId(): number;
+};
+
+/** @deprecated Alias kept for inbox call sites. */
+export type InboxSubscription = BrandChannelSubscription;
+
+export type BrandChannelSubscribeHandlers = {
+  onEvent: (payload: unknown) => void;
+  onSubscribed?: () => void;
+  onSubscriptionError?: (error: unknown) => void;
+  onConnectionLost?: (reason: ConnectionLostReason) => void;
+  subscriptionTimeoutMs?: number | undefined;
 };
 
 export type InboxSubscribeHandlers = {
@@ -301,28 +312,26 @@ export type InboxSubscribeHandlers = {
   subscriptionTimeoutMs?: number | undefined;
 };
 
-/**
- * Subscribe to private-brands.{brandId}.inbox / .inbox.conversation.updated.
- * Does not disconnect the shared Echo instance — only leaves this channel.
- */
-export function subscribeToBrandInbox(
+function subscribeToBrandChannel(
   echo: EchoLike,
   brandId: number,
-  handlers: InboxSubscribeHandlers,
-): InboxSubscription {
+  channelSuffix: string,
+  eventName: string,
+  handlers: BrandChannelSubscribeHandlers,
+): BrandChannelSubscription {
   let active = true;
   let subscribedOnce = false;
-  const channelName = `brands.${brandId}.inbox`;
+  const channelName = `brands.${brandId}.${channelSuffix}`;
   const channel = echo.private(channelName);
   const connection = echo.connector?.pusher?.connection;
   const timeoutMs = handlers.subscriptionTimeoutMs ?? 10_000;
 
   const handler = (payload: unknown) => {
     if (!active) return;
-    handlers.onSummary(payload);
+    handlers.onEvent(payload);
   };
 
-  channel.listen(".inbox.conversation.updated", handler);
+  channel.listen(eventName, handler);
 
   let subTimeout: number | null = null;
 
@@ -385,7 +394,7 @@ export function subscribeToBrandInbox(
       active = false;
       clearSubTimeout();
       try {
-        channel.stopListening(".inbox.conversation.updated");
+        channel.stopListening(eventName);
       } catch {
         /* ignore */
       }
@@ -408,6 +417,44 @@ export function subscribeToBrandInbox(
       }
     },
   };
+}
+
+/**
+ * Subscribe to private-brands.{brandId}.inbox / .inbox.conversation.updated.
+ * Does not disconnect the shared Echo instance — only leaves this channel.
+ */
+export function subscribeToBrandInbox(
+  echo: EchoLike,
+  brandId: number,
+  handlers: InboxSubscribeHandlers,
+): InboxSubscription {
+  const mapped: BrandChannelSubscribeHandlers = { onEvent: handlers.onSummary };
+  if (handlers.onSubscribed) mapped.onSubscribed = handlers.onSubscribed;
+  if (handlers.onSubscriptionError) mapped.onSubscriptionError = handlers.onSubscriptionError;
+  if (handlers.onConnectionLost) mapped.onConnectionLost = handlers.onConnectionLost;
+  if (handlers.subscriptionTimeoutMs != null) mapped.subscriptionTimeoutMs = handlers.subscriptionTimeoutMs;
+  return subscribeToBrandChannel(echo, brandId, "inbox", ".inbox.conversation.updated", mapped);
+}
+
+export type PresenceSubscribeHandlers = {
+  onPresence: (payload: unknown) => void;
+  onSubscribed?: () => void;
+  onSubscriptionError?: (error: unknown) => void;
+  onConnectionLost?: (reason: ConnectionLostReason) => void;
+  subscriptionTimeoutMs?: number | undefined;
+};
+
+export function subscribeToBrandPresence(
+  echo: EchoLike,
+  brandId: number,
+  handlers: PresenceSubscribeHandlers,
+): BrandChannelSubscription {
+  const mapped: BrandChannelSubscribeHandlers = { onEvent: handlers.onPresence };
+  if (handlers.onSubscribed) mapped.onSubscribed = handlers.onSubscribed;
+  if (handlers.onSubscriptionError) mapped.onSubscriptionError = handlers.onSubscriptionError;
+  if (handlers.onConnectionLost) mapped.onConnectionLost = handlers.onConnectionLost;
+  if (handlers.subscriptionTimeoutMs != null) mapped.subscriptionTimeoutMs = handlers.subscriptionTimeoutMs;
+  return subscribeToBrandChannel(echo, brandId, "presence", ".presence.updated", mapped);
 }
 
 /**

@@ -17,4 +17,24 @@ describe("widget.js loader hardening", () => {
     expect(source).toMatch(/brandconnect-widget/);
     expect(source).toMatch(/bc:close/);
   });
+
+  it("boots presence without requiring the chat popup to open", () => {
+    expect(source).toMatch(/display:none/);
+    expect(source).toMatch(/bc:chat-state/);
+    expect(source).toMatch(/bc:page/);
+    expect(source).toMatch(/__bcWidgetBooted/);
+  });
+
+  it("supports an opt-in consent gate without putting credentials in the DOM", () => {
+    expect(source).toMatch(/data-require-consent/);
+    expect(source).toMatch(/trackingConsent/);
+    expect(source).not.toMatch(/Bearer/);
+    expect(source).not.toMatch(/token=/);
+  });
+
+  it("patches history once for SPA page updates", () => {
+    expect(source).toMatch(/historyPatched/);
+    expect(source).toMatch(/pushState/);
+    expect(source).toMatch(/replaceState/);
+  });
 });

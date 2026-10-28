@@ -77,8 +77,6 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
         <nav className="space-y-0.5 p-2" aria-label="Main">
           {nav.map(({ to, label, icon: Icon }) => {
-            const displayLabel =
-              real && to === "/visitors" ? "Live Visitors (demo)" : label;
             return (
               <Link
                 key={to}
@@ -89,7 +87,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                 activeProps={{ className: "bg-sidebar-accent text-sidebar-accent-foreground font-medium" }}
               >
                 <Icon className="size-4" />
-                {displayLabel}
+                {label}
               </Link>
             );
           })}

@@ -5,9 +5,11 @@ use App\Http\Controllers\Api\V1\BrandController;
 use App\Http\Controllers\Api\V1\ConversationController;
 use App\Http\Controllers\Api\V1\ConversationMessageController;
 use App\Http\Controllers\Api\V1\ConversationReadController;
+use App\Http\Controllers\Api\V1\LiveVisitorController;
 use App\Http\Controllers\Api\V1\Widget\BrandConfigController;
 use App\Http\Controllers\Api\V1\Widget\BroadcastAuthController;
 use App\Http\Controllers\Api\V1\Widget\ConversationController as WidgetConversationController;
+use App\Http\Controllers\Api\V1\Widget\VisitorPresenceController;
 use App\Http\Controllers\Api\V1\Widget\VisitorSessionController;
 use Illuminate\Support\Facades\Route;
 use Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful;
@@ -29,6 +31,8 @@ Route::prefix('v1')->middleware(EnsureFrontendRequestsAreStateful::class)->group
 
         Route::get('brands', [BrandController::class, 'index'])->name('api.v1.brands.index');
         Route::post('brands', [BrandController::class, 'store'])->name('api.v1.brands.store');
+
+        Route::get('live-visitors', [LiveVisitorController::class, 'index'])->name('api.v1.live-visitors.index');
 
         Route::get('conversations', [ConversationController::class, 'index'])->name('api.v1.conversations.index');
         Route::patch('conversations/{conversation}', [ConversationController::class, 'update'])->name('api.v1.conversations.update');
@@ -56,6 +60,10 @@ Route::prefix('v1/widget')->name('api.v1.widget.')->group(function () {
 
     Route::middleware('auth:visitor')->group(function () {
         Route::post('sessions/logout', [VisitorSessionController::class, 'destroy'])->name('sessions.destroy');
+
+        Route::post('presence', [VisitorPresenceController::class, 'store'])
+            ->middleware('throttle:visitor-presence')
+            ->name('presence.store');
 
         Route::post('conversations', [WidgetConversationController::class, 'store'])->name('conversations.store');
 

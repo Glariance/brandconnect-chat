@@ -94,6 +94,14 @@ Local check helper (no secrets printed): `node scripts/verify-reverb-delivery.mj
 3. Confirm the inbox row appears via the brand inbox WebSocket event **without** waiting for the ~5s list poll.
 4. Confirm messaging on an existing conversation still works over `conversations.{id}`.
 
+### Manual acceptance (live visitor presence)
+
+1. Open agent **Live Visitors** and a brand page with the widget script (do **not** open chat).
+2. Confirm the visitor appears (label, brand, page, active/idle, chat closed).
+3. Open/minimize the popup: same visitor, `chat_opened` toggles, no duplicate identity.
+4. Send the first message: conversation appears in Inbox; visitor identity unchanged.
+5. Multi-tab / reload / separate browsers: see `docs/CHAT_REALTIME.md` presence section.
+
 ## Prerequisites
 
 - PHP 8.3+ (Laragon): `php -v`

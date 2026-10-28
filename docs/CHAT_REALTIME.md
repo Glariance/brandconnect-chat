@@ -6,8 +6,9 @@
 | --- | --- | --- |
 | `private-conversations.{conversationId}` | `visitor`, `web` | Agent with `ConversationPolicy::view`, or the conversation’s visitor |
 | `private-brands.{brandId}.inbox` | `web` only | Dashboard user with `BrandPolicy::view` / `canAccessBrand` |
+| `private-brands.{brandId}.presence` | `web` only | Same brand access as inbox |
 
-Visitors and guests must not receive brand inbox auth. Unassigned agents in the same organization are denied. Cross-organization users are denied.
+Visitors and guests must not receive brand inbox/presence auth. Unassigned agents in the same organization are denied. Cross-organization users are denied.
 
 ## Events
 
@@ -55,3 +56,23 @@ Excluded: visitor tokens, unread counts, internal notes, message bodies.
 ## Access revocation
 
 Private channel auth runs at subscribe time, not on every broadcast. Clients refresh `GET /api/v1/brands` after reconnect and brand-filter changes, leave channels that disappear, and treat list **403** as revocation.
+
+## Visitor presence
+
+Presence is **independent of conversations**.
+
+| Piece | Behavior |
+| --- | --- |
+| Bootstrap | `public/widget.js` mounts a hidden iframe immediately; `/widget` issues/resumes a visitor bearer session and starts heartbeats without opening the popup or creating a conversation |
+| Conversation | Created/resumed on first visitor message (or when the popup opens with a stored conversation id) |
+| Heartbeat | `POST /api/v1/widget/presence` about every **25s** while `document.visibilityState === "visible"` |
+| Fields | `tab_id` (per tab), sanitized `page` (path only), `chat_opened`, `activity` |
+| Active | Online and `last_activity_at` within **60s** |
+| Idle | Online (heartbeat within **90s**) without recent activity |
+| Offline | No tab heartbeat within **90s** (server timestamps). Not dependent on `unload`/`pagehide` |
+| Multi-tab | One row per visitor; closing one tab does not offline remaining heartbeating tabs |
+| Dashboard | `GET /api/v1/live-visitors` + `.presence.updated` on `brands.{id}.presence` |
+| Consent | Default: tracking starts when the script loads. Opt-in: `data-require-consent="true"` then `BrandConnect.trackingConsent = true` / `BrandConnect.enableTracking()` |
+| Privacy | No form contents, keystrokes (beyond activity boolean), fingerprints, or IP merging. Credentials stay in the iframe; never in URLs/DOM/logs/events |
+
+Storage-blocked browsers still get an in-memory visitor session for the tab lifetime; a reload creates a new visitor.

@@ -28,6 +28,8 @@ import {
 import { drainCatchUpAfter, HttpSyncWatermark } from "@/lib/catch-up";
 import { isVisitorAuthExpired, latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
 import { createSafeStorage, storagePersistenceNotice, type SafeStorage } from "@/lib/safe-storage";
+import { startVisitorPresence, type PresenceController } from "@/lib/visitor-presence";
+import { sanitizePagePath } from "@/lib/presence-utils";
 
 export const Route = createFileRoute("/widget")({
   validateSearch: (s: Record<string, unknown>) => ({ brand: String(s["brand"] ?? ""), page: String(s["page"] ?? "/") }),
@@ -121,7 +123,9 @@ function RealWidget() {
   const [booting, setBooting] = useState(true);
   const [sending, setSending] = useState(false);
   const [pendingTick, setPendingTick] = useState(0);
-  const [realtime, setRealtime] = useState<RealtimeStatus>("connecting");
+  const [realtime, setRealtime] = useState<RealtimeStatus>("unavailable");
+  const [pagePath, setPagePath] = useState(() => sanitizePagePath(page));
+  const [chatOpened, setChatOpened] = useState(false);
   const end = useRef<HTMLDivElement>(null);
 
   const pendingRef = useRef(new PendingSendRegistry());
@@ -133,9 +137,11 @@ function RealWidget() {
   const echoRef = useRef<EchoLike | null>(null);
   const subRef = useRef<ConversationSubscription | null>(null);
   const pollStopRef = useRef<(() => void) | null>(null);
+  const presenceRef = useRef<PresenceController | null>(null);
   const channelReadyRef = useRef(false);
   const genRef = useRef(0);
   const renewingRef = useRef(false);
+  const ensuringConvRef = useRef(false);
 
   tokenRef.current = token;
   convRef.current = conversationId;
@@ -195,7 +201,7 @@ function RealWidget() {
 
   const handleApiFailureRef = useRef<((e: unknown) => Promise<void>) | null>(null);
 
-  const startAnonymousSession = useCallback(async (pid: string, pagePath: string, signal?: AbortSignal, forceNew = false) => {
+  const startAnonymousSession = useCallback(async (pid: string, currentPage: string, signal?: AbortSignal, forceNew = false) => {
     const storage = storageRef.current ?? createSafeStorage();
     storageRef.current = storage;
     setStorageNotice(storagePersistenceNotice(storage.mode));
@@ -205,6 +211,7 @@ function RealWidget() {
     const cfg = await fetchWidgetConfig(pid, { signal });
     setConfig(cfg);
 
+    // Eager visitor identity for presence — no conversation until first message / chat start.
     let sessionToken = forceNew ? null : storage.getItem(SESSION_KEY(pid));
     if (!sessionToken) {
       const session = await createVisitorSession(pid, { signal });
@@ -212,21 +219,52 @@ function RealWidget() {
       storage.setItem(SESSION_KEY(pid), sessionToken);
     }
     setToken(sessionToken);
+    setPagePath(sanitizePagePath(currentPage));
 
-    let convId = forceNew ? null : storage.getItem(CONV_KEY(pid));
-    if (!convId) {
-      const conv = await createVisitorConversation(sessionToken, { page: pagePath }, { signal });
-      convId = conv.id;
-      storage.setItem(CONV_KEY(pid), convId);
-    }
-    setConversationId(convId);
+    presenceRef.current?.stop();
+    presenceRef.current = startVisitorPresence({
+      token: sessionToken,
+      initialPage: currentPage,
+      chatOpened: false,
+      getToken: () => tokenRef.current,
+    });
 
-    const page = await fetchVisitorMessages(sessionToken, convId, {}, { signal });
-    setMsgs(page.data);
-    setOlderCursor(page.nextCursor);
-    syncWatermarkRef.current.reset(latestServerId(page.data));
-    return { token: sessionToken, conversationId: convId };
+    // Conversation is created/resumed on first message or when the popup opens with a prior thread.
+    setConversationId(null);
+    setMsgs([]);
+    setOlderCursor(null);
+    syncWatermarkRef.current.reset(undefined);
+
+    return { token: sessionToken, conversationId: null as string | null };
   }, [clearVisitorIdentity]);
+
+  const ensureConversation = useCallback(async (sessionToken: string, currentPage: string, signal?: AbortSignal): Promise<string> => {
+    if (convRef.current) return convRef.current;
+    if (ensuringConvRef.current) {
+      // Wait briefly for an in-flight ensure.
+      for (let i = 0; i < 40 && ensuringConvRef.current; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        if (convRef.current) return convRef.current;
+      }
+    }
+    ensuringConvRef.current = true;
+    try {
+      if (convRef.current) return convRef.current;
+      const storage = storageRef.current ?? createSafeStorage();
+      storageRef.current = storage;
+      // POST resumes the latest open conversation or creates one — never from page visit alone.
+      const conv = await createVisitorConversation(sessionToken, { page: sanitizePagePath(currentPage) }, { signal });
+      if (publicId) storage.setItem(CONV_KEY(publicId), conv.id);
+      setConversationId(conv.id);
+      const pageMsgs = await fetchVisitorMessages(sessionToken, conv.id, {}, { signal });
+      setMsgs(pageMsgs.data);
+      setOlderCursor(pageMsgs.nextCursor);
+      syncWatermarkRef.current.reset(latestServerId(pageMsgs.data));
+      return conv.id;
+    } finally {
+      ensuringConvRef.current = false;
+    }
+  }, [publicId]);
 
   const renewSession = useCallback(async (reason: string) => {
     if (!publicId || renewingRef.current) return;
@@ -239,15 +277,18 @@ function RealWidget() {
     subRef.current = null;
     disconnectEcho(echoRef.current);
     echoRef.current = null;
+    presenceRef.current?.stop();
+    presenceRef.current = null;
     // Identity reset — drop pending sends for the old visitor.
     pendingRef.current.clearAll();
     setMsgs([]);
     setOlderCursor(null);
+    setConversationId(null);
     syncWatermarkRef.current.reset(undefined);
-    setRealtime("connecting");
+    setRealtime("unavailable");
     try {
       const ac = new AbortController();
-      await startAnonymousSession(publicId, page, ac.signal, true);
+      await startAnonymousSession(publicId, pagePath, ac.signal, true);
       setError(null);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Could not start a new session");
@@ -257,7 +298,7 @@ function RealWidget() {
       renewingRef.current = false;
       bumpPending();
     }
-  }, [page, publicId, startAnonymousSession]);
+  }, [pagePath, publicId, startAnonymousSession]);
 
   const handleApiFailure = useCallback(async (e: unknown) => {
     if (isAbortError(e)) return;
@@ -303,8 +344,56 @@ function RealWidget() {
 
   useEffect(() => {
     void bootstrap();
-    return () => bootAbortRef.current?.abort();
+    return () => {
+      bootAbortRef.current?.abort();
+      presenceRef.current?.stop();
+      presenceRef.current = null;
+    };
   }, [bootstrap]);
+
+  // Parent loader messages: page SPA updates + chat open state (validated origin/source/type).
+  useEffect(() => {
+    let lockedParentOrigin: string | null = null;
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data;
+      if (!data || typeof data !== "object") return;
+      if ((data as { source?: string }).source !== "brandconnect-loader") return;
+      if (lockedParentOrigin && e.origin !== lockedParentOrigin) return;
+      if (!lockedParentOrigin) lockedParentOrigin = e.origin;
+
+      const type = (data as { type?: string }).type;
+      if (type === "bc:parent-origin") return;
+      if (type === "bc:page" && typeof (data as { page?: string }).page === "string") {
+        const next = sanitizePagePath((data as { page: string }).page);
+        setPagePath(next);
+        presenceRef.current?.setPage(next);
+        return;
+      }
+      if (type === "bc:chat-state" && typeof (data as { open?: boolean }).open === "boolean") {
+        const opened = Boolean((data as { open: boolean }).open);
+        setChatOpened(opened);
+        presenceRef.current?.setChatOpened(opened);
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  // When the popup opens with a prior CONV_KEY, resume that conversation for the same visitor.
+  useEffect(() => {
+    if (!chatOpened || !token || !publicId || conversationId) return;
+    const stored = storageRef.current?.getItem(CONV_KEY(publicId));
+    if (!stored) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        await ensureConversation(token, pagePath);
+      } catch (e) {
+        if (!cancelled) await handleApiFailureRef.current?.(e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [chatOpened, token, publicId, conversationId, pagePath, ensureConversation]);
 
   useEffect(() => {
     if (!token || !conversationId) return;
@@ -422,16 +511,17 @@ function RealWidget() {
   };
 
   const send = async (text: string) => {
-    if (!text.trim() || !token || !conversationId || sending) return;
-    const cid = conversationId;
+    if (!text.trim() || !token || sending) return;
     const t = token;
     const body = text.trim();
-    const pending = pendingRef.current.ensure(cid, body, "visitor", newClientMessageId);
-    bumpPending();
     setSending(true);
     setError(null);
     setDraft("");
+    presenceRef.current?.noteActivity();
     try {
+      const cid = await ensureConversation(t, pagePath);
+      const pending = pendingRef.current.ensure(cid, body, "visitor", newClientMessageId);
+      bumpPending();
       const msg = await postVisitorMessage(t, cid, pending.clientMessageId, body);
       pendingRef.current.confirm(cid, pending.clientMessageId);
       if (convRef.current === cid) {
@@ -440,18 +530,19 @@ function RealWidget() {
       }
     } catch (e) {
       if (isAbortError(e)) return;
-      pendingRef.current.markFailed(cid, pending.clientMessageId);
-      bumpPending();
-      // Late failure must not overwrite another conversation/session UI state.
-      if (convRef.current === cid) {
-        setDraft(body);
-        if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
-          await renewSession("Your chat session expired.");
-        } else {
-          setError(e instanceof ApiError ? e.message : "Could not send");
-        }
-      } else if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
+      const cid = convRef.current;
+      if (cid) {
+        // Mark the most recent pending for this text if present.
+        const list = pendingRef.current.listFor(cid);
+        const last = list[list.length - 1];
+        if (last) pendingRef.current.markFailed(cid, last.clientMessageId);
+        bumpPending();
+      }
+      setDraft(body);
+      if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
         await renewSession("Your chat session expired.");
+      } else {
+        setError(e instanceof ApiError ? e.message : "Could not send");
       }
     } finally {
       setSending(false);

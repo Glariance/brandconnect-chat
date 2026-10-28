@@ -50,6 +50,14 @@ class Visitor extends Model implements Authenticatable
         return $this->hasMany(Conversation::class);
     }
 
+    /**
+     * @return HasMany<VisitorPresence, $this>
+     */
+    public function presences(): HasMany
+    {
+        return $this->hasMany(VisitorPresence::class);
+    }
+
     public function withCurrentSession(VisitorSession $session): static
     {
         $this->currentSession = $session;
