@@ -7,18 +7,25 @@ import type { ApiMessage } from "@/lib/chat-api";
 import { apiBaseUrl, reverbEnv, xsrfToken } from "@/lib/api";
 import { messageFromBroadcast } from "@/lib/chat-api";
 
+export type RealtimeStatus = "connecting" | "live" | "polling" | "unavailable";
+
+export type EchoChannel = {
+  listen: (event: string, cb: (payload: unknown) => void) => unknown;
+  stopListening: (event: string) => unknown;
+  subscribed?: ((cb: () => void) => unknown) | undefined;
+  error?: ((cb: (err: unknown) => void) => unknown) | undefined;
+};
+
 export type EchoLike = {
-  private: (channel: string) => {
-    listen: (event: string, cb: (payload: unknown) => void) => unknown;
-    stopListening: (event: string) => unknown;
-  };
+  private: (channel: string) => EchoChannel;
   leave: (channel: string) => void;
   disconnect: () => void;
   connector?: {
     pusher?: {
       connection?: {
-        bind: (event: string, cb: () => void) => void;
-        unbind: (event: string, cb?: () => void) => void;
+        bind: (event: string, cb: (...args: unknown[]) => void) => void;
+        unbind: (event: string, cb?: (...args: unknown[]) => void) => void;
+        state?: string;
       };
     };
   };
@@ -50,7 +57,7 @@ function buildAuthorizer(mode: EchoMode, visitorToken?: string) {
       };
 
       if (mode === "visitor") {
-        if (visitorToken) headers.Authorization = `Bearer ${visitorToken}`;
+        if (visitorToken) headers["Authorization"] = `Bearer ${visitorToken}`;
       } else {
         const xsrf = xsrfToken();
         if (xsrf) headers["X-XSRF-TOKEN"] = xsrf;
@@ -82,55 +89,100 @@ async function createEcho(mode: EchoMode, visitorToken?: string): Promise<EchoLi
   const env = reverbEnv();
   if (!env.key) return null;
 
-  const Echo = await loadEchoConstructor();
-  const forceTLS = env.scheme === "https";
+  try {
+    const Echo = await loadEchoConstructor();
+    const forceTLS = env.scheme === "https";
 
-  return new Echo({
-    broadcaster: "reverb",
-    key: env.key,
-    wsHost: env.host,
-    wsPort: env.port,
-    wssPort: env.port,
-    forceTLS,
-    enabledTransports: ["ws", "wss"],
-    authorizer: buildAuthorizer(mode, visitorToken),
-  });
+    return new Echo({
+      broadcaster: "reverb",
+      key: env.key,
+      wsHost: env.host,
+      wsPort: env.port,
+      wssPort: env.port,
+      forceTLS,
+      enabledTransports: ["ws", "wss"],
+      authorizer: buildAuthorizer(mode, visitorToken),
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function createAgentEcho(): Promise<EchoLike | null> {
-  return createEcho("agent");
+  return createEcho("agent").catch(() => null);
 }
 
 export function createVisitorEcho(token: string): Promise<EchoLike | null> {
-  return createEcho("visitor", token);
+  return createEcho("visitor", token).catch(() => null);
 }
 
 export type ConversationSubscription = {
   leave: () => void;
+  /** Whether leave() has already been called. */
+  get active(): boolean;
 };
 
+export type SubscribeHandlers = {
+  onMessage: (message: ApiMessage) => void;
+  /** Fires after private-channel authorization/subscription succeeds (initial + resubscribe). */
+  onSubscribed?: () => void;
+  onSubscriptionError?: (error: unknown) => void;
+};
+
+/**
+ * Subscribe to conversations.{id} / .message.created.
+ * After leave(), message/subscribed callbacks are no-ops.
+ */
 export function subscribeToConversation(
   echo: EchoLike,
   conversationId: string,
-  onMessage: (message: ApiMessage) => void,
-  onReconnect?: () => void,
+  handlers: SubscribeHandlers,
 ): ConversationSubscription {
+  let active = true;
   const channelName = `conversations.${conversationId}`;
   const channel = echo.private(channelName);
 
   const handler = (payload: unknown) => {
+    if (!active) return;
     const msg = messageFromBroadcast(payload);
-    if (msg && msg.conversation_id === conversationId) onMessage(msg);
+    if (msg && msg.conversation_id === conversationId) handlers.onMessage(msg);
   };
 
   channel.listen(".message.created", handler);
 
+  const onSubscribed = () => {
+    if (!active) return;
+    handlers.onSubscribed?.();
+  };
+  const onError = (err: unknown) => {
+    if (!active) return;
+    handlers.onSubscriptionError?.(err);
+  };
+
+  channel.subscribed?.(onSubscribed);
+  channel.error?.(onError);
+
+  // Some Echo/Pusher builds expose subscription success only via the connection binder.
+  // Also re-run catch-up when the socket reconnects *and* the channel is still active —
+  // callers should still prefer onSubscribed; this is a safety net that only fires while active.
   const connection = echo.connector?.pusher?.connection;
-  const reconnect = () => onReconnect?.();
-  connection?.bind("connected", reconnect);
+  const onConnected = () => {
+    if (!active) return;
+    // Do not treat socket connected alone as subscribed; wait for channel.subscribed.
+    // If the channel API lacks subscribed(), fall back so catch-up still runs once.
+    if (typeof channel.subscribed !== "function") {
+      handlers.onSubscribed?.();
+    }
+  };
+  connection?.bind("connected", onConnected);
 
   return {
+    get active() {
+      return active;
+    },
     leave: () => {
+      if (!active) return;
+      active = false;
       try {
         channel.stopListening(".message.created");
       } catch {
@@ -142,7 +194,7 @@ export function subscribeToConversation(
         /* ignore */
       }
       try {
-        connection?.unbind("connected", reconnect);
+        connection?.unbind("connected", onConnected);
       } catch {
         /* ignore */
       }
@@ -156,5 +208,29 @@ export function disconnectEcho(echo: EchoLike | null | undefined): void {
     echo.disconnect();
   } catch {
     /* ignore */
+  }
+}
+
+/** Bounded message polling while realtime is unavailable. Returns a disposer. */
+export function startBoundedMessagePolling(
+  tick: () => void,
+  intervalMs = 3000,
+): () => void {
+  const id = window.setInterval(tick, intervalMs);
+  return () => window.clearInterval(id);
+}
+
+export function realtimeStatusLabel(status: RealtimeStatus): string {
+  switch (status) {
+    case "connecting":
+      return "Connecting realtime…";
+    case "live":
+      return "Realtime connected";
+    case "polling":
+      return "Realtime unavailable · polling";
+    case "unavailable":
+      return "Realtime unavailable";
+    default:
+      return "";
   }
 }

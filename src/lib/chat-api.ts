@@ -52,7 +52,7 @@ export type CursorPage<T> = {
   prevCursor: string | null;
 };
 
-type RequestBase = { signal?: AbortSignal };
+type RequestBase = { signal?: AbortSignal | undefined };
 
 function unwrapList<T>(payload: unknown): T[] {
   if (Array.isArray(payload)) return payload as T[];
@@ -73,8 +73,8 @@ function unwrapOne<T>(payload: unknown): T {
 function cursorFromPayload(payload: unknown): { next: string | null; prev: string | null } {
   if (!payload || typeof payload !== "object") return { next: null, prev: null };
   const meta = (payload as { meta?: Record<string, unknown> }).meta;
-  const next = meta && typeof meta.next_cursor === "string" ? meta.next_cursor : null;
-  const prev = meta && typeof meta.prev_cursor === "string" ? meta.prev_cursor : null;
+  const next = meta && typeof meta["next_cursor"] === "string" ? meta["next_cursor"] : null;
+  const prev = meta && typeof meta["prev_cursor"] === "string" ? meta["prev_cursor"] : null;
   return { next, prev };
 }
 
@@ -279,15 +279,15 @@ export function messageFromBroadcast(payload: unknown): ApiMessage | null {
   const message = (payload as { message?: unknown }).message ?? payload;
   if (!message || typeof message !== "object") return null;
   const m = message as Record<string, unknown>;
-  if (typeof m.id !== "number" || typeof m.conversation_id !== "string" || typeof m.body !== "string") {
+  if (typeof m["id"] !== "number" || typeof m["conversation_id"] !== "string" || typeof m["body"] !== "string") {
     return null;
   }
   return {
-    id: m.id,
-    conversation_id: m.conversation_id,
-    client_message_id: String(m.client_message_id ?? ""),
-    sender_type: (m.sender_type as ApiMessage["sender_type"]) ?? "bot",
-    body: m.body,
-    created_at: String(m.created_at ?? new Date().toISOString()),
+    id: m["id"],
+    conversation_id: m["conversation_id"],
+    client_message_id: String(m["client_message_id"] ?? ""),
+    sender_type: (m["sender_type"] as ApiMessage["sender_type"]) ?? "bot",
+    body: m["body"],
+    created_at: String(m["created_at"] ?? new Date().toISOString()),
   };
 }

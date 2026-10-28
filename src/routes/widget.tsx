@@ -18,10 +18,14 @@ import {
 import {
   createVisitorEcho,
   disconnectEcho,
+  realtimeStatusLabel,
+  startBoundedMessagePolling,
   subscribeToConversation,
   type ConversationSubscription,
   type EchoLike,
+  type RealtimeStatus,
 } from "@/lib/echo-client";
+import { drainCatchUpAfter } from "@/lib/catch-up";
 import { isVisitorAuthExpired, latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
 import { createSafeStorage, storagePersistenceNotice, type SafeStorage } from "@/lib/safe-storage";
 
@@ -117,6 +121,7 @@ function RealWidget() {
   const [booting, setBooting] = useState(true);
   const [sending, setSending] = useState(false);
   const [pendingTick, setPendingTick] = useState(0);
+  const [realtime, setRealtime] = useState<RealtimeStatus>("connecting");
   const end = useRef<HTMLDivElement>(null);
 
   const pendingRef = useRef(new PendingSendRegistry());
@@ -126,6 +131,7 @@ function RealWidget() {
   const bootAbortRef = useRef<AbortController | null>(null);
   const echoRef = useRef<EchoLike | null>(null);
   const subRef = useRef<ConversationSubscription | null>(null);
+  const pollStopRef = useRef<(() => void) | null>(null);
   const genRef = useRef(0);
   const renewingRef = useRef(false);
 
@@ -152,6 +158,35 @@ function RealWidget() {
     });
     bumpPending();
   }, []);
+
+  const runCatchUp = useCallback(async (cid: string, tokenValue: string, signal?: AbortSignal) => {
+    const afterId = latestServerId(msgsRef.current);
+    if (afterId == null) {
+      try {
+        const page = await fetchVisitorMessages(tokenValue, cid, {}, { signal });
+        if (convRef.current !== cid) return;
+        applyIncoming(cid, page.data);
+      } catch (e) {
+        if (!isAbortError(e)) await handleApiFailureRef.current?.(e);
+      }
+      return;
+    }
+    const result = await drainCatchUpAfter(
+      afterId,
+      (params) => fetchVisitorMessages(tokenValue, cid, params, { signal }),
+      {
+        signal,
+        onPage: (pageMessages) => {
+          if (convRef.current !== cid) return;
+          applyIncoming(cid, pageMessages);
+        },
+      },
+    );
+    if (convRef.current !== cid) return;
+    if (result.messages.length) applyIncoming(cid, result.messages);
+  }, [applyIncoming]);
+
+  const handleApiFailureRef = useRef<((e: unknown) => Promise<void>) | null>(null);
 
   const startAnonymousSession = useCallback(async (pid: string, pagePath: string, signal?: AbortSignal, forceNew = false) => {
     const storage = storageRef.current ?? createSafeStorage();
@@ -189,13 +224,17 @@ function RealWidget() {
     if (!publicId || renewingRef.current) return;
     renewingRef.current = true;
     setError(`${reason} Starting a new anonymous session…`);
+    pollStopRef.current?.();
+    pollStopRef.current = null;
     subRef.current?.leave();
     subRef.current = null;
     disconnectEcho(echoRef.current);
     echoRef.current = null;
+    // Identity reset — drop pending sends for the old visitor.
     pendingRef.current.clearAll();
     setMsgs([]);
     setOlderCursor(null);
+    setRealtime("connecting");
     try {
       const ac = new AbortController();
       await startAnonymousSession(publicId, page, ac.signal, true);
@@ -203,6 +242,7 @@ function RealWidget() {
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Could not start a new session");
       setConfig(null);
+      setRealtime("unavailable");
     } finally {
       renewingRef.current = false;
       bumpPending();
@@ -217,6 +257,8 @@ function RealWidget() {
     }
     setError(e instanceof ApiError ? e.message : "Chat unavailable");
   }, [renewSession]);
+
+  handleApiFailureRef.current = handleApiFailure;
 
   const bootstrap = useCallback(async () => {
     if (!publicId) {
@@ -259,36 +301,60 @@ function RealWidget() {
     let cancelled = false;
     const cid = conversationId;
     const t = token;
+    setRealtime("connecting");
 
-    void createVisitorEcho(t).then((echo) => {
-      if (cancelled || tokenRef.current !== t || convRef.current !== cid) {
-        disconnectEcho(echo);
-        return;
-      }
-      disconnectEcho(echoRef.current);
-      echoRef.current = echo;
-      subRef.current?.leave();
-      subRef.current = subscribeToConversation(
-        echo,
-        cid,
-        (msg) => applyIncoming(cid, [msg]),
-        () => {
-          const after = latestServerId(msgsRef.current);
-          void fetchVisitorMessages(t, cid, after ? { after_id: after } : {})
-            .then((page) => applyIncoming(cid, page.data))
-            .catch((e) => void handleApiFailure(e));
-        },
-      );
-    });
+    const startPollingFallback = () => {
+      if (cancelled || convRef.current !== cid) return;
+      pollStopRef.current?.();
+      setRealtime("polling");
+      pollStopRef.current = startBoundedMessagePolling(() => {
+        if (convRef.current !== cid || tokenRef.current !== t) return;
+        void runCatchUp(cid, t).catch((e) => void handleApiFailure(e));
+      }, 3000);
+    };
+
+    void createVisitorEcho(t)
+      .then((echo) => {
+        if (cancelled || tokenRef.current !== t || convRef.current !== cid) {
+          disconnectEcho(echo);
+          return;
+        }
+        disconnectEcho(echoRef.current);
+        echoRef.current = echo;
+        if (!echo) {
+          startPollingFallback();
+          return;
+        }
+        subRef.current?.leave();
+        subRef.current = subscribeToConversation(echo, cid, {
+          onMessage: (msg) => applyIncoming(cid, [msg]),
+          onSubscribed: () => {
+            if (cancelled || !subRef.current?.active || convRef.current !== cid) return;
+            pollStopRef.current?.();
+            pollStopRef.current = null;
+            setRealtime("live");
+            void runCatchUp(cid, t).catch((e) => void handleApiFailure(e));
+          },
+          onSubscriptionError: () => {
+            if (cancelled || convRef.current !== cid) return;
+            startPollingFallback();
+          },
+        });
+      })
+      .catch(() => {
+        if (!cancelled) startPollingFallback();
+      });
 
     return () => {
       cancelled = true;
+      pollStopRef.current?.();
+      pollStopRef.current = null;
       subRef.current?.leave();
       subRef.current = null;
       disconnectEcho(echoRef.current);
       echoRef.current = null;
     };
-  }, [token, conversationId, applyIncoming, handleApiFailure]);
+  }, [token, conversationId, applyIncoming, handleApiFailure, runCatchUp]);
 
   useEffect(() => { end.current?.scrollIntoView({ block: "end" }); }, [msgs.length, pendingTick]);
 
@@ -321,8 +387,8 @@ function RealWidget() {
     setDraft("");
     try {
       const msg = await postVisitorMessage(t, cid, pending.clientMessageId, body);
+      pendingRef.current.confirm(cid, pending.clientMessageId);
       if (convRef.current === cid) {
-        pendingRef.current.confirm(cid, pending.clientMessageId);
         setMsgs((prev) => mergeMessages(prev, [msg]));
         bumpPending();
       }
@@ -330,11 +396,16 @@ function RealWidget() {
       if (isAbortError(e)) return;
       pendingRef.current.markFailed(cid, pending.clientMessageId);
       bumpPending();
-      setDraft(body);
-      if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
+      // Late failure must not overwrite another conversation/session UI state.
+      if (convRef.current === cid) {
+        setDraft(body);
+        if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
+          await renewSession("Your chat session expired.");
+        } else {
+          setError(e instanceof ApiError ? e.message : "Could not send");
+        }
+      } else if (e instanceof ApiError && isVisitorAuthExpired(e.status)) {
         await renewSession("Your chat session expired.");
-      } else {
-        setError(e instanceof ApiError ? e.message : "Could not send");
       }
     } finally {
       setSending(false);
@@ -374,19 +445,18 @@ function RealWidget() {
 
   return (
     <>
-      {(storageNotice || error) && (
-        <div className="space-y-1 border-b bg-muted/40 px-3 py-2 text-xs" role="status">
-          {storageNotice && <p className="text-muted-foreground">{storageNotice}</p>}
-          {error && (
-            <p className="text-destructive">
-              {error}{" "}
-              <button type="button" className="underline" onClick={() => void bootstrap()}>Retry</button>
-              {" · "}
-              <button type="button" className="underline" onClick={() => void renewSession("Starting fresh.")}>New session</button>
-            </p>
-          )}
-        </div>
-      )}
+      <div className="space-y-1 border-b bg-muted/40 px-3 py-2 text-xs" role="status">
+        <p className="text-muted-foreground">{realtimeStatusLabel(realtime)}</p>
+        {storageNotice && <p className="text-muted-foreground">{storageNotice}</p>}
+        {error && (
+          <p className="text-destructive">
+            {error}{" "}
+            <button type="button" className="underline" onClick={() => void bootstrap()}>Retry</button>
+            {" · "}
+            <button type="button" className="underline" onClick={() => void renewSession("Starting fresh.")}>New session</button>
+          </p>
+        )}
+      </div>
       {olderCursor && (
         <div className="border-b px-3 py-1 text-center">
           <button type="button" className="text-xs text-primary underline" disabled={loadingOlder} onClick={() => void loadOlder()}>
@@ -422,8 +492,8 @@ function WidgetChrome({
   endRef: React.RefObject<HTMLDivElement | null>;
   emptyHints: boolean;
   greeting: string;
-  messages: { key: string; from: string; text: string; time?: string }[];
-  status?: string;
+  messages: { key: string; from: string; text: string; time?: string | undefined }[];
+  status?: string | undefined;
 }) {
   return (
     <div className="flex h-screen flex-col bg-card text-card-foreground">
@@ -455,7 +525,7 @@ function WidgetChrome({
   );
 }
 
-function Bubble({ from, text, time }: { from: string; text: string; time?: string }) {
+function Bubble({ from, text, time }: { from: string; text: string; time?: string | undefined }) {
   const mine = from === "visitor";
   return (
     <div className={`flex ${mine ? "justify-end" : "justify-start"}`}>

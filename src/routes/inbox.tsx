@@ -19,10 +19,14 @@ import {
 import {
   createAgentEcho,
   disconnectEcho,
+  realtimeStatusLabel,
+  startBoundedMessagePolling,
   subscribeToConversation,
   type ConversationSubscription,
   type EchoLike,
+  type RealtimeStatus,
 } from "@/lib/echo-client";
+import { drainCatchUpAfter } from "@/lib/catch-up";
 import { latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
 
 export const Route = createFileRoute("/inbox")({
@@ -102,14 +106,18 @@ function RealInbox() {
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [pendingTick, setPendingTick] = useState(0);
+  const [realtime, setRealtime] = useState<RealtimeStatus>("connecting");
 
   const pendingRef = useRef(new PendingSendRegistry());
+  const draftsRef = useRef(new Map<string, string>());
   const activeRef = useRef<string | null>(null);
   const msgsRef = useRef<ApiMessage[]>([]);
   const listAbortRef = useRef<AbortController | null>(null);
   const msgsAbortRef = useRef<AbortController | null>(null);
   const echoRef = useRef<EchoLike | null>(null);
+  const echoReadyRef = useRef(false);
   const subRef = useRef<ConversationSubscription | null>(null);
+  const pollStopRef = useRef<(() => void) | null>(null);
   const convGenRef = useRef(0);
 
   activeRef.current = active;
@@ -129,27 +137,42 @@ function RealInbox() {
     bumpPending();
   }, []);
 
-  const catchUpAfter = useCallback(async (conversationId: string, afterId?: number) => {
+  const runCatchUp = useCallback(async (conversationId: string, signal?: AbortSignal) => {
     const gen = convGenRef.current;
-    try {
-      const page = await fetchAgentMessages(conversationId, afterId ? { after_id: afterId } : {});
-      if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
-      if (afterId) applyIncoming(conversationId, page.data);
-      else {
-        setMsgs(page.data);
-        setOlderCursor(page.nextCursor);
+    const afterId = latestServerId(msgsRef.current);
+    if (afterId == null) {
+      try {
+        const page = await fetchAgentMessages(conversationId, {}, { signal });
+        if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+        setMsgs((prev) => mergeMessages(prev, page.data));
+        setOlderCursor((c) => c ?? page.nextCursor);
         for (const m of page.data) {
           if (m.client_message_id) pendingRef.current.confirm(conversationId, m.client_message_id);
         }
         bumpPending();
+      } catch (e) {
+        if (isAbortError(e) || gen !== convGenRef.current) return;
       }
-      const readId = latestServerId(page.data.length ? page.data : msgsRef.current);
-      if (readId) {
-        try { await markConversationRead(conversationId, readId); } catch { /* ignore */ }
-      }
-    } catch (e) {
-      if (isAbortError(e) || gen !== convGenRef.current) return;
-      setError(e instanceof ApiError ? e.message : "Failed to sync messages");
+      return;
+    }
+
+    const result = await drainCatchUpAfter(
+      afterId,
+      (params) => fetchAgentMessages(conversationId, params, { signal }),
+      {
+        signal,
+        onPage: (pageMessages) => {
+          if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+          applyIncoming(conversationId, pageMessages);
+        },
+      },
+    );
+
+    if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
+    if (result.messages.length) applyIncoming(conversationId, result.messages);
+    const readId = latestServerId(msgsRef.current);
+    if (readId) {
+      try { await markConversationRead(conversationId, readId, { signal }); } catch { /* ignore */ }
     }
   }, [applyIncoming]);
 
@@ -158,7 +181,6 @@ function RealInbox() {
     const ac = new AbortController();
     listAbortRef.current = ac;
     try {
-      setError(null);
       const list = await fetchConversations({ status: tab }, { signal: ac.signal });
       setRows(list);
       setActive((prev) => (prev && list.some((c) => c.id === prev) ? prev : list[0]?.id ?? null));
@@ -184,19 +206,33 @@ function RealInbox() {
 
   useEffect(() => {
     let cancelled = false;
-    void createAgentEcho().then((echo) => {
-      if (cancelled) {
-        disconnectEcho(echo);
-        return;
-      }
-      echoRef.current = echo;
-    });
+    setRealtime("connecting");
+    void createAgentEcho()
+      .then((echo) => {
+        if (cancelled) {
+          disconnectEcho(echo);
+          return;
+        }
+        echoRef.current = echo;
+        echoReadyRef.current = true;
+        setRealtime(echo ? "connecting" : "polling");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        echoRef.current = null;
+        echoReadyRef.current = true;
+        setRealtime("polling");
+      });
     return () => {
       cancelled = true;
+      pollStopRef.current?.();
+      pollStopRef.current = null;
       subRef.current?.leave();
       subRef.current = null;
       disconnectEcho(echoRef.current);
       echoRef.current = null;
+      // Logout/unmount identity reset
+      pendingRef.current.clearAll();
     };
   }, []);
 
@@ -204,11 +240,17 @@ function RealInbox() {
     msgsAbortRef.current?.abort();
     subRef.current?.leave();
     subRef.current = null;
+    pollStopRef.current?.();
+    pollStopRef.current = null;
 
+    // Preserve pending sends across switches; only swap transcript + draft.
     setMsgs([]);
     setOlderCursor(null);
-    setDraft("");
-    if (active) pendingRef.current.clearConversation(active);
+    if (active) {
+      setDraft(draftsRef.current.get(active) ?? "");
+    } else {
+      setDraft("");
+    }
     bumpPending();
 
     if (!active) return;
@@ -225,6 +267,10 @@ function RealInbox() {
         if (gen !== convGenRef.current || activeRef.current !== conversationId) return;
         setMsgs(page.data);
         setOlderCursor(page.nextCursor);
+        for (const m of page.data) {
+          if (m.client_message_id) pendingRef.current.confirm(conversationId, m.client_message_id);
+        }
+        bumpPending();
         const readId = latestServerId(page.data);
         if (readId) {
           try { await markConversationRead(conversationId, readId, { signal: ac.signal }); } catch { /* ignore */ }
@@ -235,32 +281,55 @@ function RealInbox() {
       }
     })();
 
-    const trySubscribe = () => {
-      const echo = echoRef.current;
-      if (!echo || activeRef.current !== conversationId) return;
-      subRef.current?.leave();
-      subRef.current = subscribeToConversation(
-        echo,
-        conversationId,
-        (msg) => applyIncoming(conversationId, [msg]),
-        () => void catchUpAfter(conversationId, latestServerId(msgsRef.current)),
-      );
+    const startPollingFallback = () => {
+      pollStopRef.current?.();
+      setRealtime((s) => (s === "live" ? s : "polling"));
+      pollStopRef.current = startBoundedMessagePolling(() => {
+        if (activeRef.current !== conversationId) return;
+        void runCatchUp(conversationId);
+      }, 3000);
     };
-    trySubscribe();
-    const wait = window.setInterval(() => {
-      if (echoRef.current) {
-        trySubscribe();
-        window.clearInterval(wait);
+
+    const attachSubscription = (echo: EchoLike) => {
+      subRef.current?.leave();
+      subRef.current = subscribeToConversation(echo, conversationId, {
+        onMessage: (msg) => applyIncoming(conversationId, [msg]),
+        onSubscribed: () => {
+          if (activeRef.current !== conversationId || !subRef.current?.active) return;
+          pollStopRef.current?.();
+          pollStopRef.current = null;
+          setRealtime("live");
+          void runCatchUp(conversationId, ac.signal);
+        },
+        onSubscriptionError: () => {
+          if (activeRef.current !== conversationId) return;
+          setRealtime("polling");
+          startPollingFallback();
+        },
+      });
+    };
+
+    const waitForEcho = window.setInterval(() => {
+      if (!echoReadyRef.current) return;
+      window.clearInterval(waitForEcho);
+      if (activeRef.current !== conversationId) return;
+      const echo = echoRef.current;
+      if (!echo) {
+        startPollingFallback();
+        return;
       }
-    }, 200);
+      attachSubscription(echo);
+    }, 50);
 
     return () => {
-      window.clearInterval(wait);
+      window.clearInterval(waitForEcho);
       ac.abort();
+      pollStopRef.current?.();
+      pollStopRef.current = null;
       subRef.current?.leave();
       subRef.current = null;
     };
-  }, [active, applyIncoming, catchUpAfter]);
+  }, [active, applyIncoming, runCatchUp]);
 
   const loadOlder = async () => {
     if (!active || !olderCursor || loadingOlder) return;
@@ -273,7 +342,9 @@ function RealInbox() {
       setMsgs((prev) => mergeMessages(page.data, prev));
       setOlderCursor(page.nextCursor);
     } catch (e) {
-      if (!isAbortError(e)) setError(e instanceof ApiError ? e.message : "Could not load older messages");
+      if (!isAbortError(e) && activeRef.current === conversationId) {
+        setError(e instanceof ApiError ? e.message : "Could not load older messages");
+      }
     } finally {
       setLoadingOlder(false);
     }
@@ -298,6 +369,11 @@ function RealInbox() {
   void pendingTick;
   const pendingForActive = conv.id ? pendingRef.current.listFor(conv.id) : [];
 
+  const setDraftForActive = (value: string) => {
+    if (active) draftsRef.current.set(active, value);
+    setDraft(value);
+  };
+
   const send = async () => {
     if (!draft.trim() || !conv.id || sending) return;
     const conversationId = conv.id;
@@ -305,12 +381,16 @@ function RealInbox() {
     const pending = pendingRef.current.ensure(conversationId, text, "agent", newClientMessageId);
     bumpPending();
     setSending(true);
-    setError(null);
-    setDraft("");
+    if (activeRef.current === conversationId) {
+      setError(null);
+      setDraftForActive("");
+    } else {
+      draftsRef.current.set(conversationId, "");
+    }
     try {
       const msg = await postAgentMessage(conversationId, pending.clientMessageId, text);
+      pendingRef.current.confirm(conversationId, pending.clientMessageId);
       if (activeRef.current === conversationId) {
-        pendingRef.current.confirm(conversationId, pending.clientMessageId);
         setMsgs((prev) => mergeMessages(prev, [msg]));
         bumpPending();
       }
@@ -319,10 +399,16 @@ function RealInbox() {
       if (isAbortError(e)) return;
       pendingRef.current.markFailed(conversationId, pending.clientMessageId);
       bumpPending();
-      setDraft(text);
-      setError(e instanceof ApiError ? e.message : "Send failed");
+      // Late failure must not clobber another conversation's draft/error.
+      if (activeRef.current === conversationId) {
+        setDraftForActive(text);
+        setError(e instanceof ApiError ? e.message : "Send failed");
+      } else {
+        draftsRef.current.set(conversationId, text);
+      }
     } finally {
-      setSending(false);
+      if (activeRef.current === conversationId) setSending(false);
+      else setSending(false);
     }
   };
 
@@ -330,7 +416,7 @@ function RealInbox() {
     if (!conv.id) return;
     const pending = pendingRef.current.get(conv.id, clientMessageId);
     if (!pending) return;
-    setDraft(pending.text);
+    setDraftForActive(pending.text);
     pending.status = "pending";
     bumpPending();
   };
@@ -364,6 +450,7 @@ function RealInbox() {
 
   return (
     <>
+      <p className="mb-2 text-xs text-muted-foreground" role="status">{realtimeStatusLabel(realtime)}</p>
       {error && (
         <div className="mb-3 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive" role="alert">
           <span className="flex-1">{error}</span>
@@ -381,7 +468,7 @@ function RealInbox() {
           setActive={setActive}
           msgs={displayMsgs}
           draft={draft}
-          setDraft={setDraft}
+          setDraft={setDraftForActive}
           onSend={() => void send()}
           onClose={() => void onClose()}
           onLoadOlder={olderCursor ? () => void loadOlder() : undefined}
@@ -403,14 +490,14 @@ function InboxLayout({
   shown: Row[];
   conv: Row;
   setActive: (id: string) => void;
-  msgs: { key: string; from: string; text: string; time: string; failed?: boolean; onRetry?: () => void }[];
+  msgs: { key: string; from: string; text: string; time: string; failed?: boolean | undefined; onRetry?: (() => void) | undefined }[];
   draft: string;
   setDraft: (v: string) => void;
   onSend: () => void;
   onClose: () => void;
   sideDetails: string[][];
-  onLoadOlder?: () => void;
-  loadingOlder?: boolean;
+  onLoadOlder?: (() => void) | undefined;
+  loadingOlder?: boolean | undefined;
 }) {
   return (
     <div className="grid h-[calc(100vh-7.5rem)] gap-4 md:grid-cols-[300px_1fr] xl:grid-cols-[300px_1fr_260px]">

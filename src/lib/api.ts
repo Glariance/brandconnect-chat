@@ -1,10 +1,10 @@
 /** Credentialed API client for dashboard (Sanctum cookies) and visitor Bearer auth. */
 
 const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env ?? {};
-const API_URL = (viteEnv.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+const API_URL = (viteEnv["VITE_API_URL"] ?? "http://localhost:8000").replace(/\/$/, "");
 
 export const isRealChatEnabled = () =>
-  String(viteEnv.VITE_REAL_CHAT ?? "true").toLowerCase() !== "false";
+  String(viteEnv["VITE_REAL_CHAT"] ?? "true").toLowerCase() !== "false";
 
 export class ApiError extends Error {
   status: number;
@@ -45,14 +45,14 @@ export function xsrfToken(): string | null {
 }
 
 type RequestOpts = {
-  method?: string;
+  method?: string | undefined;
   body?: unknown;
-  bearer?: string | null;
+  bearer?: string | null | undefined;
   /** Skip CSRF bootstrap (GET-only public endpoints). */
-  public?: boolean;
-  signal?: AbortSignal;
+  public?: boolean | undefined;
+  signal?: AbortSignal | undefined;
   /** Absolute path under the API origin (defaults to /api/v1 + path). */
-  absolutePath?: string;
+  absolutePath?: string | undefined;
 };
 
 export async function api<T = unknown>(path: string, opts: RequestOpts = {}): Promise<T> {
@@ -68,7 +68,7 @@ export async function api<T = unknown>(path: string, opts: RequestOpts = {}): Pr
   }
 
   if (opts.bearer) {
-    headers.Authorization = `Bearer ${opts.bearer}`;
+    headers["Authorization"] = `Bearer ${opts.bearer}`;
   }
 
   if (opts.body !== undefined) {
@@ -79,13 +79,16 @@ export async function api<T = unknown>(path: string, opts: RequestOpts = {}): Pr
     ? `${API_URL}${opts.absolutePath}`
     : `${API_URL}/api/v1${path}`;
 
-  const res = await fetch(url, {
+  const init: RequestInit = {
     method,
     credentials: opts.bearer ? "omit" : "include",
     headers,
-    body: opsBody(opts.body),
-    signal: opts.signal,
-  });
+  };
+  const body = opsBody(opts.body);
+  if (body !== undefined) init.body = body;
+  if (opts.signal) init.signal = opts.signal;
+
+  const res = await fetch(url, init);
 
   if (res.status === 204) {
     return undefined as T;
@@ -127,9 +130,9 @@ export function resetCsrf(): void {
 
 export function reverbEnv() {
   return {
-    key: viteEnv.VITE_REVERB_APP_KEY ?? "",
-    host: viteEnv.VITE_REVERB_HOST ?? "localhost",
-    port: Number(viteEnv.VITE_REVERB_PORT ?? 8081),
-    scheme: viteEnv.VITE_REVERB_SCHEME ?? "http",
+    key: viteEnv["VITE_REVERB_APP_KEY"] ?? "",
+    host: viteEnv["VITE_REVERB_HOST"] ?? "localhost",
+    port: Number(viteEnv["VITE_REVERB_PORT"] ?? 8081),
+    scheme: viteEnv["VITE_REVERB_SCHEME"] ?? "http",
   };
 }

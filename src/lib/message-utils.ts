@@ -100,12 +100,12 @@ export class PendingSendRegistry {
     return row;
   }
 
-  markFailed(conversationId: string, clientMessageId: string): void {
+  markFailed(conversationId: string, clientMessageId: string): PendingMessage | undefined {
     const row = this.get(conversationId, clientMessageId);
-    if (row) {
-      row.status = "failed";
-      this.pending.set(pendingKey(conversationId, clientMessageId), row);
-    }
+    if (!row) return undefined;
+    row.status = "failed";
+    this.pending.set(pendingKey(conversationId, clientMessageId), row);
+    return row;
   }
 
   /** Drop pending once the server has confirmed that client_message_id. */
@@ -113,12 +113,22 @@ export class PendingSendRegistry {
     this.pending.delete(pendingKey(conversationId, clientMessageId));
   }
 
+  /** Explicit user discard of a failed/pending send. */
+  discard(conversationId: string, clientMessageId: string): void {
+    this.pending.delete(pendingKey(conversationId, clientMessageId));
+  }
+
+  /**
+   * Clear pending for a conversation. Prefer confirm/discard for normal flows;
+   * use only on identity reset when abandoning that conversation entirely.
+   */
   clearConversation(conversationId: string): void {
     for (const key of [...this.pending.keys()]) {
       if (key.startsWith(`${conversationId}:`)) this.pending.delete(key);
     }
   }
 
+  /** Identity/logout reset — drops every in-flight send. */
   clearAll(): void {
     this.pending.clear();
   }

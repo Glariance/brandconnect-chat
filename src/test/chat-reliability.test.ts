@@ -8,7 +8,17 @@ import {
   pendingKey,
 } from "@/lib/message-utils";
 import { messageFromBroadcast, newClientMessageId, type ApiMessage } from "@/lib/chat-api";
-import { subscribeToConversation, type EchoLike } from "@/lib/echo-client";
+import {
+  createAgentEcho,
+  createVisitorEcho,
+  realtimeStatusLabel,
+  startBoundedMessagePolling,
+  subscribeToConversation,
+  type EchoChannel,
+  type EchoLike,
+} from "@/lib/echo-client";
+import { drainCatchUpAfter } from "@/lib/catch-up";
+import * as api from "@/lib/api";
 
 function msg(partial: Partial<ApiMessage> & Pick<ApiMessage, "id" | "body">): ApiMessage {
   return {
@@ -18,6 +28,36 @@ function msg(partial: Partial<ApiMessage> & Pick<ApiMessage, "id" | "body">): Ap
     created_at: "2026-01-01T00:00:00Z",
     ...partial,
   };
+}
+
+function makeEcho(overrides?: {
+  subscribed?: (cb: () => void) => unknown;
+  error?: (cb: (err: unknown) => void) => unknown;
+}): { echo: EchoLike; channel: EchoChannel; getHandler: () => ((payload: unknown) => void) | null } {
+  let handler: ((payload: unknown) => void) | null = null;
+  const channel: EchoChannel = {
+    listen: (_event, cb) => {
+      handler = cb;
+      return undefined;
+    },
+    stopListening: vi.fn(),
+    subscribed: overrides?.subscribed,
+    error: overrides?.error,
+  };
+  const echo: EchoLike = {
+    private: () => channel,
+    leave: vi.fn(),
+    disconnect: vi.fn(),
+    connector: {
+      pusher: {
+        connection: {
+          bind: vi.fn(),
+          unbind: vi.fn(),
+        },
+      },
+    },
+  };
+  return { echo, channel, getHandler: () => handler };
 }
 
 describe("pending client_message_id stability", () => {
@@ -36,7 +76,25 @@ describe("pending client_message_id stability", () => {
     expect(pendingKey("conv-a", first.clientMessageId)).toBe(`conv-a:${first.clientMessageId}`);
   });
 
-  it("binds pending rows to a conversation and clears only after confirm", () => {
+  it("preserves pending UUID across conversation switch away and back", () => {
+    const registry = new PendingSendRegistry();
+    const createId = vi.fn()
+      .mockReturnValueOnce("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .mockReturnValueOnce("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+
+    const failed = registry.ensure("c1", "retry me", "agent", createId);
+    registry.markFailed("c1", failed.clientMessageId);
+
+    // Switch away: do NOT clearConversation / clearAll (inbox/widget preserve pending).
+    expect(registry.listFor("c1")).toHaveLength(1);
+
+    // Switch back and retry — same client_message_id.
+    const again = registry.ensure("c1", "retry me", "agent", createId);
+    expect(again.clientMessageId).toBe(failed.clientMessageId);
+    expect(createId).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears pending only on confirm, discard, or identity reset", () => {
     const registry = new PendingSendRegistry();
     const a = registry.ensure("c1", "one", "visitor", () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     registry.ensure("c2", "two", "visitor", () => "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
@@ -45,8 +103,42 @@ describe("pending client_message_id stability", () => {
     registry.confirm("c1", a.clientMessageId);
     expect(registry.listFor("c1")).toHaveLength(0);
     expect(registry.listFor("c2")).toHaveLength(1);
-    registry.clearConversation("c2");
+
+    const b = registry.listFor("c2")[0]!;
+    registry.discard("c2", b.clientMessageId);
     expect(registry.listFor("c2")).toHaveLength(0);
+
+    registry.ensure("c3", "three", "agent", () => "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+    registry.clearAll();
+    expect(registry.listFor("c3")).toHaveLength(0);
+  });
+
+  it("late send failure after switch updates pending but not the other conversation draft/error", () => {
+    const registry = new PendingSendRegistry();
+    const drafts = new Map<string, string>();
+    let active = "c1";
+    let error: string | null = null;
+
+    const pending = registry.ensure("c1", "hello", "agent", () => "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+    drafts.set("c1", "");
+    drafts.set("c2", "draft for c2");
+
+    // Switch away before the HTTP failure returns.
+    active = "c2";
+
+    registry.markFailed("c1", pending.clientMessageId);
+    // Mirror inbox/widget late-failure guard.
+    if (active === "c1") {
+      drafts.set("c1", "hello");
+      error = "Send failed";
+    } else {
+      drafts.set("c1", "hello");
+    }
+
+    expect(registry.get("c1", pending.clientMessageId)?.status).toBe("failed");
+    expect(drafts.get("c2")).toBe("draft for c2");
+    expect(error).toBeNull();
+    expect(drafts.get("c1")).toBe("hello");
   });
 });
 
@@ -97,69 +189,195 @@ describe("message merge and pagination helpers", () => {
   });
 });
 
-describe("stale response / Echo cleanup", () => {
+describe("Echo null / rejected initialization", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("ignores late handlers after leave and cleans up listeners", () => {
-    const stopListening = vi.fn();
-    const leave = vi.fn();
-    const unbind = vi.fn();
-    let handler: ((payload: unknown) => void) | null = null;
+  it("createAgentEcho and createVisitorEcho resolve null when Reverb key is missing", async () => {
+    vi.spyOn(api, "reverbEnv").mockReturnValue({
+      key: "",
+      host: "localhost",
+      port: 8081,
+      scheme: "http",
+    });
 
+    await expect(createAgentEcho()).resolves.toBeNull();
+    await expect(createVisitorEcho("tok")).resolves.toBeNull();
+    expect(realtimeStatusLabel("polling")).toMatch(/polling/i);
+  });
+
+  it("createAgentEcho and createVisitorEcho resolve null when initialization rejects", async () => {
+    vi.spyOn(api, "reverbEnv").mockImplementation(() => {
+      throw new Error("echo env unavailable");
+    });
+
+    await expect(createAgentEcho()).resolves.toBeNull();
+    await expect(createVisitorEcho("tok")).resolves.toBeNull();
+  });
+
+  it("bounded polling disposer clears the interval timer", () => {
+    vi.useFakeTimers();
+    const tick = vi.fn();
+    const stop = startBoundedMessagePolling(tick, 1000);
+    vi.advanceTimersByTime(3000);
+    expect(tick).toHaveBeenCalledTimes(3);
+    stop();
+    vi.advanceTimersByTime(5000);
+    expect(tick).toHaveBeenCalledTimes(3);
+    vi.useRealTimers();
+  });
+});
+
+describe("catch-up drain and concurrent merge", () => {
+  it("drains more than 100 missed messages across pages before complete", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => msg({ id: i + 1, body: `m${i + 1}` }));
+    const page2 = Array.from({ length: 25 }, (_, i) => msg({ id: 101 + i, body: `m${101 + i}` }));
+    const fetchPage = vi
+      .fn()
+      .mockResolvedValueOnce({ data: page1, nextCursor: "cursor-2", prevCursor: null })
+      .mockResolvedValueOnce({ data: page2, nextCursor: null, prevCursor: "cursor-2" });
+
+    const onPage = vi.fn();
+    const result = await drainCatchUpAfter(0, fetchPage, { onPage });
+
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(fetchPage.mock.calls[0]?.[0]).toEqual({ after_id: 0 });
+    expect(fetchPage.mock.calls[1]?.[0]).toEqual({ after_id: 0, cursor: "cursor-2" });
+    expect(result.complete).toBe(true);
+    expect(result.messages).toHaveLength(125);
+    expect(result.messages[0]?.id).toBe(1);
+    expect(result.messages.at(-1)?.id).toBe(125);
+    expect(onPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not claim complete when a page is empty but still has a next cursor (gap)", async () => {
+    const fetchPage = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [msg({ id: 1, body: "a" })], nextCursor: "more", prevCursor: null })
+      .mockResolvedValueOnce({ data: [], nextCursor: "still-more", prevCursor: "more" });
+
+    const result = await drainCatchUpAfter(0, fetchPage);
+    expect(result.complete).toBe(false);
+    expect(result.messages.map((m) => m.id)).toEqual([1]);
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops without advancing past a failed page", async () => {
+    const fetchPage = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [msg({ id: 1, body: "a" })], nextCursor: "page-2", prevCursor: null })
+      .mockRejectedValueOnce(new Error("network"));
+
+    const result = await drainCatchUpAfter(0, fetchPage);
+    expect(result.complete).toBe(false);
+    expect(result.messages.map((m) => m.id)).toEqual([1]);
+  });
+
+  it("merges messages that arrive during subscription/catch-up with HTTP pages", async () => {
+    let live: ApiMessage[] = [msg({ id: 10, body: "already loaded" })];
+    const applyIncoming = (incoming: ApiMessage[]) => {
+      live = mergeMessages(live, incoming);
+    };
+
+    // Realtime arrives while catch-up HTTP is in flight.
+    applyIncoming([msg({ id: 12, body: "from echo during catch-up" })]);
+
+    const result = await drainCatchUpAfter(10, async () => ({
+      data: [msg({ id: 11, body: "from http" }), msg({ id: 12, body: "from http dup" })],
+      nextCursor: null,
+      prevCursor: null,
+    }), {
+      onPage: (pageMessages) => applyIncoming(pageMessages),
+    });
+
+    applyIncoming(result.messages);
+    expect(live.map((m) => m.id)).toEqual([10, 11, 12]);
+    expect(live.find((m) => m.id === 12)?.body).toBe("from http dup");
+  });
+});
+
+describe("Echo subscription lifecycle", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("runs onSubscribed on channel subscribe, not merely socket connected", () => {
+    const subscribedCbs: Array<() => void> = [];
+    const connectedCbs: Array<() => void> = [];
+    const onSubscribed = vi.fn();
+    const onMessage = vi.fn();
+
+    const channel: EchoChannel = {
+      listen: vi.fn(),
+      stopListening: vi.fn(),
+      subscribed: (cb) => {
+        subscribedCbs.push(cb);
+        return undefined;
+      },
+    };
     const echo: EchoLike = {
-      private: () => ({
-        listen: (_event, cb) => {
-          handler = cb;
-          return undefined;
-        },
-        stopListening,
-      }),
-      leave,
+      private: () => channel,
+      leave: vi.fn(),
       disconnect: vi.fn(),
       connector: {
         pusher: {
           connection: {
-            bind: vi.fn(),
-            unbind,
+            bind: (event, cb) => {
+              if (event === "connected") connectedCbs.push(cb as () => void);
+            },
+            unbind: vi.fn(),
           },
         },
       },
     };
 
+    subscribeToConversation(echo, "conv-1", { onMessage, onSubscribed });
+
+    connectedCbs.forEach((cb) => cb());
+    expect(onSubscribed).not.toHaveBeenCalled();
+
+    subscribedCbs.forEach((cb) => cb());
+    expect(onSubscribed).toHaveBeenCalledTimes(1);
+  });
+
+  it("callback invoked after cleanup has no effect", () => {
+    const subscribedCbs: Array<() => void> = [];
+    const { echo, getHandler } = makeEcho({
+      subscribed: (cb) => {
+        subscribedCbs.push(cb);
+        return undefined;
+      },
+    });
     const onMessage = vi.fn();
-    const sub = subscribeToConversation(echo, "conv-1", onMessage);
-    handler?.({ message: msg({ id: 1, body: "ok", conversation_id: "conv-1" }) });
-    expect(onMessage).toHaveBeenCalledTimes(1);
+    const onSubscribed = vi.fn();
+
+    const sub = subscribeToConversation(echo, "conv-1", { onMessage, onSubscribed });
+    expect(sub.active).toBe(true);
 
     sub.leave();
-    expect(stopListening).toHaveBeenCalledWith(".message.created");
-    expect(leave).toHaveBeenCalledWith("conversations.conv-1");
-    expect(unbind).toHaveBeenCalled();
+    expect(sub.active).toBe(false);
+    expect(echo.leave).toHaveBeenCalledWith("conversations.conv-1");
 
-    handler?.({ message: msg({ id: 2, body: "late", conversation_id: "conv-1" }) });
-    // Handler reference still exists on mock, but production leave stops listening;
-    // assert cleanup APIs were invoked (subscription teardown contract).
-    expect(stopListening).toHaveBeenCalled();
+    getHandler()?.({ message: msg({ id: 1, body: "late", conversation_id: "conv-1" }) });
+    subscribedCbs.forEach((cb) => cb());
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onSubscribed).not.toHaveBeenCalled();
   });
 
   it("drops broadcast messages for a different conversation id", () => {
-    let handler: ((payload: unknown) => void) | null = null;
-    const echo: EchoLike = {
-      private: () => ({
-        listen: (_e, cb) => {
-          handler = cb;
-          return undefined;
-        },
-        stopListening: vi.fn(),
-      }),
-      leave: vi.fn(),
-      disconnect: vi.fn(),
-    };
+    const { echo, getHandler } = makeEcho();
     const onMessage = vi.fn();
-    subscribeToConversation(echo, "conv-1", onMessage);
-    handler?.({ message: msg({ id: 3, body: "other", conversation_id: "conv-OTHER" }) });
+    subscribeToConversation(echo, "conv-1", { onMessage });
+    getHandler()?.({ message: msg({ id: 3, body: "other", conversation_id: "conv-OTHER" }) });
     expect(onMessage).not.toHaveBeenCalled();
+  });
+
+  it("delivers matching conversation broadcasts while active", () => {
+    const { echo, getHandler } = makeEcho();
+    const onMessage = vi.fn();
+    subscribeToConversation(echo, "conv-1", { onMessage });
+    getHandler()?.({ message: msg({ id: 1, body: "ok", conversation_id: "conv-1" }) });
+    expect(onMessage).toHaveBeenCalledTimes(1);
   });
 });
