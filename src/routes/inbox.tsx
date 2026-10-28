@@ -2,11 +2,12 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Send, Paperclip, Smile, Bot, Radio } from "lucide-react";
 import { Card, Badge, Btn } from "@/components/app-shell";
-import { conversations, messages } from "@/lib/sample-data";
+import { brands as sampleBrands, conversations, messages } from "@/lib/sample-data";
 import { addMessage, closeConv, markRead, now, useLiveChats } from "@/lib/chat-store";
 import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
 import {
   fetchAgentMessages,
+  fetchBrands,
   fetchConversations,
   formatMsgTime,
   markConversationRead,
@@ -87,6 +88,7 @@ function DemoInbox() {
       setDraft={setDraft}
       onSend={send}
       onClose={() => liveConv && closeConv(liveConv.id)}
+      visitorPreviewBrandId={sampleBrands[0]?.publicId ?? null}
       sideDetails={liveConv
         ? [["Source", "Chat widget"], ["Current page", liveConv.page], ["Brand", liveConv.brand], ["Messages", String(liveConv.messages.length)]]
         : [["Email", "maria@example.com"], ["Location", "Albany, US"], ["Current page", "/pricing"], ["Source", "google / cpc"], ["Visits", "3"], ["Lead stage", "Qualified"]]}
@@ -108,6 +110,8 @@ function RealInbox() {
   const [pendingTick, setPendingTick] = useState(0);
   const [realtime, setRealtime] = useState<RealtimeStatus>("connecting");
 
+  const [previewBrandId, setPreviewBrandId] = useState<string | null>(null);
+
   const pendingRef = useRef(new PendingSendRegistry());
   const draftsRef = useRef(new Map<string, string>());
   const activeRef = useRef<string | null>(null);
@@ -122,6 +126,14 @@ function RealInbox() {
   /** True only between channel.subscribed and connection-lost / leave. */
   const channelReadyRef = useRef(false);
   const convGenRef = useRef(0);
+
+  useEffect(() => {
+    const ac = new AbortController();
+    void fetchBrands({ signal: ac.signal })
+      .then((list) => setPreviewBrandId(list[0]?.public_id ?? null))
+      .catch(() => setPreviewBrandId(null));
+    return () => ac.abort();
+  }, []);
 
   activeRef.current = active;
   msgsRef.current = msgs;
@@ -521,6 +533,7 @@ function RealInbox() {
           onClose={() => void onClose()}
           onLoadOlder={olderCursor ? () => void loadOlder() : undefined}
           loadingOlder={loadingOlder}
+          visitorPreviewBrandId={apiConv?.brand?.public_id ?? previewBrandId}
           sideDetails={apiConv
             ? [["Source", "Chat widget"], ["Current page", apiConv.page ?? "/"], ["Brand", apiConv.brand?.name ?? String(apiConv.brand_id)], ["Messages", String(msgs.length)]]
             : [["Source", "—"]]}
@@ -531,7 +544,7 @@ function RealInbox() {
 }
 
 function InboxLayout({
-  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails, onLoadOlder, loadingOlder,
+  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails, onLoadOlder, loadingOlder, visitorPreviewBrandId,
 }: {
   tab: "open" | "pending" | "closed";
   setTab: (t: "open" | "pending" | "closed") => void;
@@ -546,6 +559,8 @@ function InboxLayout({
   sideDetails: string[][];
   onLoadOlder?: (() => void) | undefined;
   loadingOlder?: boolean | undefined;
+  /** Real mode: API brand public_id. Demo mode: sample publicId. Null → link to Brands. */
+  visitorPreviewBrandId?: string | null | undefined;
 }) {
   return (
     <div className="grid h-[calc(100vh-7.5rem)] gap-4 md:grid-cols-[300px_1fr] xl:grid-cols-[300px_1fr_260px]">
@@ -574,7 +589,20 @@ function InboxLayout({
             </li>
           ))}
         </ul>
-        <Link to="/widget-demo" search={{ brand: "nw_7f3a91" }} reloadDocument className="border-t p-3 text-center text-xs text-primary underline">Open demo site to chat as a visitor</Link>
+        {visitorPreviewBrandId ? (
+          <Link
+            to="/widget-demo"
+            search={{ brand: visitorPreviewBrandId }}
+            reloadDocument
+            className="border-t p-3 text-center text-xs text-primary underline"
+          >
+            Open demo site to chat as a visitor
+          </Link>
+        ) : (
+          <Link to="/brands" className="border-t p-3 text-center text-xs text-primary underline">
+            Create a brand to preview the visitor widget →
+          </Link>
+        )}
       </Card>
       <Card className="flex flex-col overflow-hidden">
         <div className="flex items-center gap-3 border-b p-3">

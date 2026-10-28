@@ -74,19 +74,23 @@ export function AppShell({ children }: { children: ReactNode }) {
           </button>
         </div>
         <nav className="space-y-0.5 p-2" aria-label="Main">
-          {nav.map(({ to, label, icon: Icon }) => (
-            <Link
-              key={to}
-              to={to}
-              onClick={() => setOpen(false)}
-              activeOptions={{ exact: to === "/" }}
-              className="flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-              activeProps={{ className: "bg-sidebar-accent text-sidebar-accent-foreground font-medium" }}
-            >
-              <Icon className="size-4" />
-              {label}
-            </Link>
-          ))}
+          {nav.map(({ to, label, icon: Icon }) => {
+            const displayLabel =
+              real && to === "/visitors" ? "Live Visitors (demo)" : label;
+            return (
+              <Link
+                key={to}
+                to={to}
+                onClick={() => setOpen(false)}
+                activeOptions={{ exact: to === "/" }}
+                className="flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+                activeProps={{ className: "bg-sidebar-accent text-sidebar-accent-foreground font-medium" }}
+              >
+                <Icon className="size-4" />
+                {displayLabel}
+              </Link>
+            );
+          })}
         </nav>
       </aside>
       {open && <div className="fixed inset-0 z-30 bg-foreground/40 lg:hidden" onClick={() => setOpen(false)} />}
