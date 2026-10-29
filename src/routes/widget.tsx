@@ -373,6 +373,10 @@ function RealWidget() {
         const opened = Boolean((data as { open: boolean }).open);
         setChatOpened(opened);
         presenceRef.current?.setChatOpened(opened);
+        return;
+      }
+      if (type === "bc:host-visibility" && typeof (data as { visible?: boolean }).visible === "boolean") {
+        presenceRef.current?.setHostVisible(Boolean((data as { visible: boolean }).visible));
       }
     };
     window.addEventListener("message", onMessage);

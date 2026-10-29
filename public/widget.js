@@ -49,6 +49,53 @@
     postToFrame({ type: "bc:chat-state", open: open });
   }
 
+  /** Host page visibility — not chat open/closed. Closed popup must stay online. */
+  function notifyHostVisibility() {
+    var visible = true;
+    try {
+      visible = document.visibilityState !== "hidden";
+    } catch (e) { /* ignore */ }
+    postToFrame({ type: "bc:host-visibility", visible: visible });
+  }
+
+  /**
+   * Keep the iframe in the document and navigated on page load.
+   * Closed chrome stays display:block (off-screen + opacity 0). Hiding via the
+   * CSS display property made the iframe document report visibilityState
+   * "hidden" and previously skipped presence heartbeats until the launcher opened.
+   */
+  function applyFrameChrome() {
+    if (!frame) return;
+    frame.style.position = "fixed";
+    frame.style.width = "370px";
+    frame.style.height = "540px";
+    frame.style.maxWidth = "calc(100vw - 40px)";
+    frame.style.maxHeight = "calc(100vh - 120px)";
+    frame.style.border = "0";
+    frame.style.borderRadius = "16px";
+    frame.style.zIndex = "2147483646";
+    frame.style.background = "#fff";
+    if (open) {
+      frame.style.display = "block";
+      frame.style.opacity = "1";
+      frame.style.pointerEvents = "auto";
+      frame.style.bottom = "92px";
+      frame.style.right = "20px";
+      frame.style.left = "auto";
+      frame.style.top = "auto";
+      frame.style.boxShadow = "0 12px 40px rgba(0,0,0,.18)";
+    } else {
+      frame.style.display = "block";
+      frame.style.opacity = "0";
+      frame.style.pointerEvents = "none";
+      frame.style.left = "-10000px";
+      frame.style.top = "0";
+      frame.style.bottom = "auto";
+      frame.style.right = "auto";
+      frame.style.boxShadow = "none";
+    }
+  }
+
   function patchHistoryOnce() {
     if (historyPatched) return;
     historyPatched = true;
@@ -82,6 +129,7 @@
     window.__bcWidgetBooted = true;
 
     frame = document.createElement("iframe");
+    // Assign src immediately on page load — do not wait for launcher click.
     frame.src =
       origin +
       "/widget?brand=" +
@@ -90,9 +138,7 @@
       encodeURIComponent(sanitizePath(location.pathname));
     frame.title = "Chat with us";
     frame.setAttribute("allow", "clipboard-write");
-    // Iframe stays mounted while closed so presence can bootstrap without opening chat.
-    frame.style.cssText =
-      "position:fixed;bottom:92px;right:20px;width:370px;height:540px;max-width:calc(100vw - 40px);max-height:calc(100vh - 120px);border:0;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,.18);z-index:2147483646;display:none;background:#fff";
+    applyFrameChrome();
 
     btn = document.createElement("button");
     btn.setAttribute("aria-label", "Open chat");
@@ -106,13 +152,14 @@
     btn.innerHTML = chatIcon;
     btn.onclick = function () {
       open = !open;
-      frame.style.display = open ? "block" : "none";
+      applyFrameChrome();
       btn.innerHTML = open ? closeIcon : chatIcon;
       btn.setAttribute("aria-label", open ? "Close chat" : "Open chat");
       if (open) {
         postToFrame({ type: "bc:parent-origin", parentOrigin: parentOrigin });
       }
       notifyChatState();
+      notifyHostVisibility();
     };
 
     window.addEventListener("message", function (e) {
@@ -121,6 +168,8 @@
       if (!isCloseMessage(e.data)) return;
       if (open) btn.onclick();
     });
+
+    document.addEventListener("visibilitychange", notifyHostVisibility);
 
     function append() {
       if (!document.body) {
@@ -133,6 +182,7 @@
       frame.addEventListener("load", function () {
         notifyPage();
         notifyChatState();
+        notifyHostVisibility();
       });
     }
     append();

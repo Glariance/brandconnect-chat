@@ -19,10 +19,13 @@ describe("widget.js loader hardening", () => {
   });
 
   it("boots presence without requiring the chat popup to open", () => {
-    expect(source).toMatch(/display:none/);
+    expect(source).not.toMatch(/style\.display\s*=\s*["']none["']/);
+    expect(source).toMatch(/frame\.style\.display = "block"/);
     expect(source).toMatch(/bc:chat-state/);
     expect(source).toMatch(/bc:page/);
+    expect(source).toMatch(/bc:host-visibility/);
     expect(source).toMatch(/__bcWidgetBooted/);
+    expect(source).toMatch(/left = "-10000px"/);
   });
 
   it("supports an opt-in consent gate without putting credentials in the DOM", () => {

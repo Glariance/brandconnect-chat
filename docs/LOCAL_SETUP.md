@@ -102,6 +102,8 @@ Local check helper (no secrets printed): `node scripts/verify-reverb-delivery.mj
 4. Send the first message: conversation appears in Inbox; visitor identity unchanged.
 5. Multi-tab / reload / separate browsers: see `docs/CHAT_REALTIME.md` presence section.
 
+**Regression (closed popup):** the loader must keep the iframe navigated with closed chrome (`opacity:0` / off-screen, still `display:block`) and heartbeats must follow **host** `bc:host-visibility`, not the iframe Page Visibility API. Using CSS `display:none` previously made `document.visibilityState === "hidden"` inside the iframe and suppressed presence until the launcher opened.
+
 ## Prerequisites
 
 - PHP 8.3+ (Laragon): `php -v`

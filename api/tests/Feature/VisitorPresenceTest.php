@@ -186,6 +186,28 @@ class VisitorPresenceTest extends TestCase
         $this->getJson('/api/v1/live-visitors')->assertUnauthorized();
     }
 
+    public function test_presence_heartbeat_does_not_create_a_conversation(): void
+    {
+        $brand = Brand::factory()->create();
+        $visitor = Visitor::factory()->for($brand)->create();
+
+        $this->actingAsVisitor($visitor)
+            ->postJson('/api/v1/widget/presence', [
+                'tab_id' => (string) Str::uuid(),
+                'page' => '/browse',
+                'chat_opened' => false,
+            ])
+            ->assertCreated();
+
+        $this->assertDatabaseCount('conversations', 0);
+        $this->assertDatabaseCount('visitor_presences', 1);
+        $this->assertDatabaseHas('visitor_presences', [
+            'visitor_id' => $visitor->id,
+            'page' => '/browse',
+            'chat_opened' => false,
+        ]);
+    }
+
     public function test_presence_is_rate_limited(): void
     {
         $visitor = Visitor::factory()->create();

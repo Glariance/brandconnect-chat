@@ -63,9 +63,9 @@ Presence is **independent of conversations**.
 
 | Piece | Behavior |
 | --- | --- |
-| Bootstrap | `public/widget.js` mounts a hidden iframe immediately; `/widget` issues/resumes a visitor bearer session and starts heartbeats without opening the popup or creating a conversation |
+| Bootstrap | `public/widget.js` mounts and **navigates** the iframe immediately on page load (closed chrome uses off-screen `opacity:0`, not `display:none`); `/widget` issues/resumes a visitor bearer session and sends the **first** presence upsert immediately without opening the popup or creating a conversation |
 | Conversation | Created/resumed on first visitor message (or when the popup opens with a stored conversation id) |
-| Heartbeat | `POST /api/v1/widget/presence` about every **25s** while `document.visibilityState === "visible"` |
+| Heartbeat | `POST /api/v1/widget/presence` immediately, then about every **25s** while the **host** page is visible (`bc:host-visibility`). Do not use the iframe document’s Page Visibility API — a closed panel must not mark the visitor offline |
 | Fields | `tab_id` (per tab), sanitized `page` (path only), `chat_opened`, `activity` |
 | Active | Online and `last_activity_at` within **60s** |
 | Idle | Online (heartbeat within **90s**) without recent activity |
