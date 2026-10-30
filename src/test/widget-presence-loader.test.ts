@@ -85,6 +85,16 @@ describe("widget.js loader presence bootstrap (no launcher click)", () => {
     expect(loaderSource).toMatch(/visibilitychange/);
     expect(loaderSource).toMatch(/notifyHostVisibility/);
   });
+
+  it("implements a widget-ready handshake and host-state replay", () => {
+    expect(loaderSource).toMatch(/bc:widget-ready/);
+    expect(loaderSource).toMatch(/bc:host-state/);
+    expect(loaderSource).toMatch(/replayHostState/);
+    const loadIdx = loaderSource.indexOf('frame.addEventListener("load"');
+    const srcIdx = loaderSource.indexOf("frame.src =");
+    expect(loadIdx).toBeGreaterThan(-1);
+    expect(srcIdx).toBeGreaterThan(loadIdx);
+  });
 });
 
 describe("visitor presence host visibility", () => {

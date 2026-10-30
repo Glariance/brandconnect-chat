@@ -12,6 +12,8 @@
   var historyPatched = false;
   var frame = null;
   var btn = null;
+  var widgetReady = false;
+  var bootStartedAt = Date.now();
 
   function trackingAllowed() {
     if (!requireConsent) return true;
@@ -58,11 +60,30 @@
     postToFrame({ type: "bc:host-visibility", visible: visible });
   }
 
+  /** Replay authoritative host state after the iframe listener is ready. */
+  function replayHostState() {
+    postToFrame({
+      type: "bc:host-state",
+      page: sanitizePath(location.pathname),
+      open: open,
+      visible: (function () {
+        try {
+          return document.visibilityState !== "hidden";
+        } catch (e) {
+          return true;
+        }
+      })(),
+      parentOrigin: parentOrigin,
+      loaderBootMs: Date.now() - bootStartedAt,
+    });
+    notifyPage();
+    notifyChatState();
+    notifyHostVisibility();
+  }
+
   /**
    * Keep the iframe in the document and navigated on page load.
-   * Closed chrome stays display:block (off-screen + opacity 0). Hiding via the
-   * CSS display property made the iframe document report visibilityState
-   * "hidden" and previously skipped presence heartbeats until the launcher opened.
+   * Closed chrome stays display:block (off-screen + opacity 0).
    */
   function applyFrameChrome() {
     if (!frame) return;
@@ -124,21 +145,34 @@
     );
   }
 
+  function isReadyMessage(data) {
+    return !!(
+      data &&
+      typeof data === "object" &&
+      data.type === "bc:widget-ready" &&
+      data.source === "brandconnect-widget"
+    );
+  }
+
   function boot() {
     if (window.__bcWidgetBooted) return;
     window.__bcWidgetBooted = true;
 
     frame = document.createElement("iframe");
-    // Assign src immediately on page load — do not wait for launcher click.
-    frame.src =
-      origin +
-      "/widget?brand=" +
-      encodeURIComponent(brand) +
-      "&page=" +
-      encodeURIComponent(sanitizePath(location.pathname));
     frame.title = "Chat with us";
     frame.setAttribute("allow", "clipboard-write");
     applyFrameChrome();
+
+    // Register load BEFORE append/src so a cached/fast load cannot be missed.
+    frame.addEventListener("load", function () {
+      // Prefer handshake; still nudge state in case ready arrived before this.
+      if (widgetReady) replayHostState();
+      else {
+        notifyPage();
+        notifyChatState();
+        notifyHostVisibility();
+      }
+    });
 
     btn = document.createElement("button");
     btn.setAttribute("aria-label", "Open chat");
@@ -160,16 +194,25 @@
       }
       notifyChatState();
       notifyHostVisibility();
+      if (widgetReady) replayHostState();
     };
 
     window.addEventListener("message", function (e) {
       if (e.origin !== origin) return;
       if (!frame || e.source !== frame.contentWindow) return;
+      if (isReadyMessage(e.data)) {
+        widgetReady = true;
+        replayHostState();
+        return;
+      }
       if (!isCloseMessage(e.data)) return;
       if (open) btn.onclick();
     });
 
-    document.addEventListener("visibilitychange", notifyHostVisibility);
+    document.addEventListener("visibilitychange", function () {
+      notifyHostVisibility();
+      if (widgetReady) replayHostState();
+    });
 
     function append() {
       if (!document.body) {
@@ -179,11 +222,16 @@
       document.body.appendChild(frame);
       document.body.appendChild(btn);
       patchHistoryOnce();
-      frame.addEventListener("load", function () {
-        notifyPage();
-        notifyChatState();
-        notifyHostVisibility();
-      });
+      // Navigate after insert + load listener — presence must not wait for launcher click.
+      frame.src =
+        origin +
+        "/widget?brand=" +
+        encodeURIComponent(brand) +
+        "&page=" +
+        encodeURIComponent(sanitizePath(location.pathname)) +
+        (location.search.indexOf("diag=1") >= 0 || location.search.indexOf("diag=true") >= 0
+          ? "&diag=1"
+          : "");
     }
     append();
   }

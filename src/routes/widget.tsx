@@ -28,11 +28,24 @@ import {
 import { drainCatchUpAfter, HttpSyncWatermark } from "@/lib/catch-up";
 import { isVisitorAuthExpired, latestServerId, mergeMessages, PendingSendRegistry } from "@/lib/message-utils";
 import { createSafeStorage, storagePersistenceNotice, type SafeStorage } from "@/lib/safe-storage";
-import { startVisitorPresence, type PresenceController } from "@/lib/visitor-presence";
+import { startVisitorPresence, type PresenceController, type PresenceFailure } from "@/lib/visitor-presence";
 import { sanitizePagePath } from "@/lib/presence-utils";
+import {
+  presenceDiagEnabled,
+  presenceDiagMark,
+  presenceDiagReset,
+  presenceDiagSnapshot,
+  subscribePresenceDiag,
+  type PresenceDiagEvent,
+} from "@/lib/presence-diag";
 
 export const Route = createFileRoute("/widget")({
-  validateSearch: (s: Record<string, unknown>) => ({ brand: String(s["brand"] ?? ""), page: String(s["page"] ?? "/") }),
+  validateSearch: (s: Record<string, unknown>) => ({
+    brand: String(s["brand"] ?? ""),
+    page: String(s["page"] ?? "/"),
+    // Boolean avoids TanStack JSON-encoding strings as diag=%221%22 in the URL.
+    diag: s["diag"] === true || s["diag"] === 1 || s["diag"] === "1" || s["diag"] === "true",
+  }),
   head: () => ({
     meta: [
       { title: "Chat · BrandConnect widget" },
@@ -56,6 +69,40 @@ function Widget() {
 function closeParent() {
   const target = document.referrer ? (() => { try { return new URL(document.referrer).origin; } catch { return "*"; } })() : "*";
   window.parent.postMessage({ type: "bc:close", source: "brandconnect-widget" }, target);
+}
+
+function PresenceDiagPanel({
+  events,
+  presenceError,
+  registered,
+  chatOpened,
+  pagePath,
+}: {
+  events: PresenceDiagEvent[];
+  presenceError: string | null;
+  registered: boolean;
+  chatOpened: boolean;
+  pagePath: string;
+}) {
+  return (
+    <div
+      className="max-h-48 overflow-y-auto border-b border-amber-500/40 bg-amber-50 px-2 py-1 font-mono text-[10px] text-amber-950"
+      role="status"
+      data-testid="presence-diag"
+    >
+      <p className="font-semibold">
+        Presence diag · registered={String(registered)} · chat={chatOpened ? "open" : "closed"} · page={pagePath}
+      </p>
+      {presenceError && <p className="text-red-700">err: {presenceError}</p>}
+      <ul className="mt-1 space-y-0.5">
+        {events.map((e, i) => (
+          <li key={`${e.t}-${e.stage}-${i}`}>
+            +{e.t}ms {e.stage}{e.detail ? ` · ${e.detail}` : ""}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 function DemoWidget() {
@@ -105,7 +152,8 @@ function DemoWidget() {
 }
 
 function RealWidget() {
-  const { brand: publicId, page } = Route.useSearch();
+  const { brand: publicId, page, diag: diagParam } = Route.useSearch();
+  const showDiag = presenceDiagEnabled(diagParam);
   const storageRef = useRef<SafeStorage | null>(null);
   if (!storageRef.current && typeof window !== "undefined") {
     storageRef.current = createSafeStorage();
@@ -126,6 +174,9 @@ function RealWidget() {
   const [realtime, setRealtime] = useState<RealtimeStatus>("unavailable");
   const [pagePath, setPagePath] = useState(() => sanitizePagePath(page));
   const [chatOpened, setChatOpened] = useState(false);
+  const [presenceError, setPresenceError] = useState<string | null>(null);
+  const [presenceRegistered, setPresenceRegistered] = useState(false);
+  const [diagEvents, setDiagEvents] = useState<PresenceDiagEvent[]>([]);
   const end = useRef<HTMLDivElement>(null);
 
   const pendingRef = useRef(new PendingSendRegistry());
@@ -138,14 +189,21 @@ function RealWidget() {
   const subRef = useRef<ConversationSubscription | null>(null);
   const pollStopRef = useRef<(() => void) | null>(null);
   const presenceRef = useRef<PresenceController | null>(null);
+  const parentOriginRef = useRef<string | null>(null);
+  const chatOpenedRef = useRef(false);
+  const hostVisibleRef = useRef(true);
+  const lastHostPageRef = useRef<string | null>(null);
   const channelReadyRef = useRef(false);
   const genRef = useRef(0);
   const renewingRef = useRef(false);
   const ensuringConvRef = useRef(false);
+  const presenceAuthRenewRef = useRef(false);
+  const renewSessionRef = useRef<((reason: string) => Promise<void>) | null>(null);
 
   tokenRef.current = token;
   convRef.current = conversationId;
   msgsRef.current = msgs;
+  chatOpenedRef.current = chatOpened;
 
   const bumpPending = () => setPendingTick((n) => n + 1);
 
@@ -201,32 +259,60 @@ function RealWidget() {
 
   const handleApiFailureRef = useRef<((e: unknown) => Promise<void>) | null>(null);
 
+  const onPresenceFailure = useCallback(async (failure: PresenceFailure) => {
+    presenceDiagMark("presence_err", `${failure.kind}:${failure.status ?? ""} ${failure.message}`.trim());
+    setPresenceError(failure.message);
+    if (failure.kind !== "auth") return;
+    if (presenceAuthRenewRef.current || renewingRef.current) return;
+    presenceAuthRenewRef.current = true;
+    await renewSessionRef.current?.("Presence session expired.");
+  }, []);
+
   const startAnonymousSession = useCallback(async (pid: string, currentPage: string, signal?: AbortSignal, forceNew = false) => {
     const storage = storageRef.current ?? createSafeStorage();
     storageRef.current = storage;
     setStorageNotice(storagePersistenceNotice(storage.mode));
+    presenceDiagReset();
+    presenceDiagMark("widget_mount", forceNew ? "forceNew" : "resume");
 
     if (forceNew) clearVisitorIdentity(pid);
 
     const cfg = await fetchWidgetConfig(pid, { signal });
+    presenceDiagMark("config", cfg.public_id);
     setConfig(cfg);
 
     // Eager visitor identity for presence — no conversation until first message / chat start.
     let sessionToken = forceNew ? null : storage.getItem(SESSION_KEY(pid));
+    let issuedNew = false;
     if (!sessionToken) {
       const session = await createVisitorSession(pid, { signal });
       sessionToken = session.token;
       storage.setItem(SESSION_KEY(pid), sessionToken);
+      issuedNew = true;
     }
+    presenceDiagMark("session", issuedNew ? "issued" : "storage");
     setToken(sessionToken);
     setPagePath(sanitizePagePath(currentPage));
+    presenceAuthRenewRef.current = false;
+    setPresenceRegistered(false);
 
     presenceRef.current?.stop();
+    presenceDiagMark("presence_start");
+    const initialPage = lastHostPageRef.current ?? currentPage;
     presenceRef.current = startVisitorPresence({
       token: sessionToken,
-      initialPage: currentPage,
-      chatOpened: false,
+      initialPage,
+      chatOpened: chatOpenedRef.current,
+      hostVisible: hostVisibleRef.current,
       getToken: () => tokenRef.current,
+      onSuccess: ({ initial }) => {
+        setPresenceError(null);
+        setPresenceRegistered(true);
+        presenceDiagMark("presence_ok", initial ? "initial" : "heartbeat");
+      },
+      onError: (failure) => {
+        void onPresenceFailure(failure);
+      },
     });
 
     // Conversation is created/resumed on first message or when the popup opens with a prior thread.
@@ -236,7 +322,7 @@ function RealWidget() {
     syncWatermarkRef.current.reset(undefined);
 
     return { token: sessionToken, conversationId: null as string | null };
-  }, [clearVisitorIdentity]);
+  }, [clearVisitorIdentity, onPresenceFailure]);
 
   const ensureConversation = useCallback(async (sessionToken: string, currentPage: string, signal?: AbortSignal): Promise<string> => {
     if (convRef.current) return convRef.current;
@@ -290,6 +376,7 @@ function RealWidget() {
       const ac = new AbortController();
       await startAnonymousSession(publicId, pagePath, ac.signal, true);
       setError(null);
+      setPresenceError(null);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Could not start a new session");
       setConfig(null);
@@ -299,6 +386,8 @@ function RealWidget() {
       bumpPending();
     }
   }, [pagePath, publicId, startAnonymousSession]);
+
+  renewSessionRef.current = renewSession;
 
   const handleApiFailure = useCallback(async (e: unknown) => {
     if (isAbortError(e)) return;
@@ -351,35 +440,106 @@ function RealWidget() {
     };
   }, [bootstrap]);
 
-  // Parent loader messages: page SPA updates + chat open state (validated origin/source/type).
   useEffect(() => {
-    let lockedParentOrigin: string | null = null;
+    if (!showDiag) return;
+    setDiagEvents(presenceDiagSnapshot());
+    return subscribePresenceDiag(() => setDiagEvents(presenceDiagSnapshot()));
+  }, [showDiag]);
+
+  // Parent loader messages + ready handshake (listener before ready signal).
+  useEffect(() => {
+    presenceDiagMark("listener_ready");
+
+    const applyHostState = (data: Record<string, unknown>) => {
+      if (typeof data["parentOrigin"] === "string") {
+        parentOriginRef.current = data["parentOrigin"];
+      }
+      if (typeof data["page"] === "string") {
+        const next = sanitizePagePath(data["page"]);
+        lastHostPageRef.current = next;
+        setPagePath(next);
+        presenceRef.current?.setPage(next);
+        presenceDiagMark("page", next);
+      }
+      if (typeof data["open"] === "boolean") {
+        const opened = Boolean(data["open"]);
+        setChatOpened(opened);
+        chatOpenedRef.current = opened;
+        presenceRef.current?.setChatOpened(opened);
+        presenceDiagMark("chat_state", opened ? "open" : "closed");
+      }
+      if (typeof data["visible"] === "boolean") {
+        const visible = Boolean(data["visible"]);
+        hostVisibleRef.current = visible;
+        presenceRef.current?.setHostVisible(visible);
+        presenceDiagMark("host_visibility", visible ? "visible" : "hidden");
+      }
+      if (typeof data["loaderBootMs"] === "number") {
+        presenceDiagMark("handshake_ack", `loaderBootMs=${Math.round(data["loaderBootMs"])}`);
+      }
+      presenceRef.current?.flush();
+    };
+
     const onMessage = (e: MessageEvent) => {
       const data = e.data;
       if (!data || typeof data !== "object") return;
       if ((data as { source?: string }).source !== "brandconnect-loader") return;
-      if (lockedParentOrigin && e.origin !== lockedParentOrigin) return;
-      if (!lockedParentOrigin) lockedParentOrigin = e.origin;
+      // Only accept messages from the embedding parent window.
+      if (e.source !== window.parent) return;
+      if (parentOriginRef.current && e.origin !== parentOriginRef.current) return;
+      if (!parentOriginRef.current) parentOriginRef.current = e.origin;
 
       const type = (data as { type?: string }).type;
-      if (type === "bc:parent-origin") return;
+      if (type === "bc:parent-origin") {
+        if (typeof (data as { parentOrigin?: string }).parentOrigin === "string") {
+          parentOriginRef.current = (data as { parentOrigin: string }).parentOrigin;
+        }
+        return;
+      }
+      if (type === "bc:host-state") {
+        applyHostState(data as Record<string, unknown>);
+        return;
+      }
       if (type === "bc:page" && typeof (data as { page?: string }).page === "string") {
         const next = sanitizePagePath((data as { page: string }).page);
+        lastHostPageRef.current = next;
         setPagePath(next);
         presenceRef.current?.setPage(next);
+        presenceDiagMark("page", next);
         return;
       }
       if (type === "bc:chat-state" && typeof (data as { open?: boolean }).open === "boolean") {
         const opened = Boolean((data as { open: boolean }).open);
         setChatOpened(opened);
+        chatOpenedRef.current = opened;
         presenceRef.current?.setChatOpened(opened);
+        presenceDiagMark("chat_state", opened ? "open" : "closed");
         return;
       }
       if (type === "bc:host-visibility" && typeof (data as { visible?: boolean }).visible === "boolean") {
-        presenceRef.current?.setHostVisible(Boolean((data as { visible: boolean }).visible));
+        const visible = Boolean((data as { visible: boolean }).visible);
+        hostVisibleRef.current = visible;
+        presenceRef.current?.setHostVisible(visible);
+        presenceDiagMark("host_visibility", visible ? "visible" : "hidden");
       }
     };
+
     window.addEventListener("message", onMessage);
+
+    // Signal loader only after the listener is installed so host state is not missed.
+    try {
+      const target =
+        parentOriginRef.current
+        ?? (document.referrer ? new URL(document.referrer).origin : "*");
+      window.parent.postMessage(
+        { type: "bc:widget-ready", source: "brandconnect-widget" },
+        target,
+      );
+      presenceDiagMark("handshake_sent", typeof target === "string" ? target : "*");
+    } catch {
+      presenceDiagMark("handshake_sent", "failed");
+    }
+
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
@@ -556,16 +716,34 @@ function RealWidget() {
   void pendingTick;
   const pendingForActive = conversationId ? pendingRef.current.listFor(conversationId) : [];
 
+  const diagPanel = showDiag ? (
+    <PresenceDiagPanel
+      events={diagEvents}
+      presenceError={presenceError}
+      registered={presenceRegistered}
+      chatOpened={chatOpened}
+      pagePath={pagePath}
+    />
+  ) : null;
+
   if (booting) {
-    return <div className="p-6 text-sm text-muted-foreground">Starting chat…</div>;
+    return (
+      <>
+        {diagPanel}
+        <div className="p-6 text-sm text-muted-foreground">Starting chat…</div>
+      </>
+    );
   }
 
   if (!config) {
     return (
-      <div className="space-y-3 p-6 text-sm">
-        <p className="text-muted-foreground">{error ?? "This chat isn't set up."}</p>
-        <button type="button" className="underline" onClick={() => void bootstrap()}>Retry</button>
-      </div>
+      <>
+        {diagPanel}
+        <div className="space-y-3 p-6 text-sm">
+          <p className="text-muted-foreground">{error ?? "This chat isn't set up."}</p>
+          <button type="button" className="underline" onClick={() => void bootstrap()}>Retry</button>
+        </div>
+      </>
     );
   }
 
@@ -586,9 +764,13 @@ function RealWidget() {
 
   return (
     <>
+      {diagPanel}
       <div className="space-y-1 border-b bg-muted/40 px-3 py-2 text-xs" role="status">
         <p className="text-muted-foreground">{realtimeStatusLabel(realtime)}</p>
         {storageNotice && <p className="text-muted-foreground">{storageNotice}</p>}
+        {presenceError && !error && (
+          <p className="text-amber-700 dark:text-amber-400">Presence: {presenceError}</p>
+        )}
         {error && (
           <p className="text-destructive">
             {error}{" "}

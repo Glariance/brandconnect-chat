@@ -43,6 +43,8 @@ function injectWidget(publicId: string, color: string) {
   // Reset loader singleton so brand switches re-inject cleanly in demos.
   // @ts-expect-error demo reset
   window.__bcWidget = false;
+  // @ts-expect-error demo reset
+  window.__bcWidgetBooted = false;
   const s = document.createElement("script");
   s.src = `${location.origin}/widget.js`;
   s.setAttribute("data-brand-id", publicId);

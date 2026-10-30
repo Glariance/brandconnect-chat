@@ -24,8 +24,18 @@ describe("widget.js loader hardening", () => {
     expect(source).toMatch(/bc:chat-state/);
     expect(source).toMatch(/bc:page/);
     expect(source).toMatch(/bc:host-visibility/);
+    expect(source).toMatch(/bc:widget-ready/);
+    expect(source).toMatch(/bc:host-state/);
+    expect(source).toMatch(/replayHostState/);
     expect(source).toMatch(/__bcWidgetBooted/);
     expect(source).toMatch(/left = "-10000px"/);
+  });
+
+  it("registers the iframe load listener before assigning src", () => {
+    const loadIdx = source.indexOf('frame.addEventListener("load"');
+    const srcIdx = source.indexOf("frame.src =");
+    expect(loadIdx).toBeGreaterThan(-1);
+    expect(srcIdx).toBeGreaterThan(loadIdx);
   });
 
   it("supports an opt-in consent gate without putting credentials in the DOM", () => {
