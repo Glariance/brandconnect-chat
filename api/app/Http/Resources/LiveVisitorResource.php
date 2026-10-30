@@ -30,6 +30,8 @@ class LiveVisitorResource extends JsonResource
             'chat_opened' => (bool) ($row['chat_opened'] ?? false),
             'tab_count' => (int) ($row['tab_count'] ?? 0),
             'version' => $row['version'] ?? $row['last_seen_at'] ?? null,
+            /** Present on visitor heartbeat responses; omitted for agent live lists. */
+            'open_conversation_id' => $row['open_conversation_id'] ?? null,
         ];
     }
 }

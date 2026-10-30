@@ -39,6 +39,7 @@ import {
   subscribePresenceDiag,
   type PresenceDiagEvent,
 } from "@/lib/presence-diag";
+import { isNearBottom, noteIncomingMessages } from "@/lib/widget-auto-open";
 
 export const Route = createFileRoute("/widget")({
   validateSearch: (s: Record<string, unknown>) => ({
@@ -67,9 +68,32 @@ function Widget() {
   return isRealChatEnabled() ? <RealWidget /> : <DemoWidget />;
 }
 
+function parentPostTarget(): string {
+  return document.referrer
+    ? (() => {
+        try {
+          return new URL(document.referrer).origin;
+        } catch {
+          return "*";
+        }
+      })()
+    : "*";
+}
+
 function closeParent() {
-  const target = document.referrer ? (() => { try { return new URL(document.referrer).origin; } catch { return "*"; } })() : "*";
-  window.parent.postMessage({ type: "bc:close", source: "brandconnect-widget" }, target);
+  window.parent.postMessage({ type: "bc:close", source: "brandconnect-widget" }, parentPostTarget());
+}
+
+/** Ask the host loader to expand the panel. Does not focus the composer. */
+function requestParentOpen(reason: string) {
+  try {
+    window.parent.postMessage(
+      { type: "bc:open", source: "brandconnect-widget", reason },
+      parentPostTarget(),
+    );
+  } catch {
+    /* ignore */
+  }
 }
 
 function PresenceDiagPanel({
@@ -178,7 +202,9 @@ function RealWidget() {
   const [presenceError, setPresenceError] = useState<string | null>(null);
   const [presenceRegistered, setPresenceRegistered] = useState(false);
   const [diagEvents, setDiagEvents] = useState<PresenceDiagEvent[]>([]);
+  const [unseenBelow, setUnseenBelow] = useState(false);
   const end = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const pendingRef = useRef(new PendingSendRegistry());
   const tokenRef = useRef<string | null>(null);
@@ -197,6 +223,8 @@ function RealWidget() {
   const hostVisibleRef = useRef(true);
   const lastHostPageRef = useRef<string | null>(null);
   const channelReadyRef = useRef(false);
+  const knownMsgIdsRef = useRef<Set<number>>(new Set());
+  const attachingConvRef = useRef(false);
   const genRef = useRef(0);
   const renewingRef = useRef(false);
   const ensuringConvRef = useRef(false);
@@ -216,9 +244,16 @@ function RealWidget() {
     storage?.removeItem(CONV_KEY(pid));
   }, []);
 
-  const applyIncoming = useCallback((cid: string, incoming: ApiMessage[]) => {
+  const applyIncoming = useCallback((cid: string, incoming: ApiMessage[], opts?: { seedOnly?: boolean }) => {
     // Echo / display merge only — does not advance HTTP sync watermark.
     if (convRef.current !== cid) return;
+    const decision = noteIncomingMessages(
+      knownMsgIdsRef.current,
+      incoming,
+      opts?.seedOnly ? { seedOnly: true } : {},
+    );
+    knownMsgIdsRef.current = decision.knownIds;
+
     setMsgs((prev) => {
       const merged = mergeMessages(prev, incoming);
       for (const m of incoming) {
@@ -227,6 +262,15 @@ function RealWidget() {
       return merged;
     });
     bumpPending();
+
+    if (decision.openForIds.length > 0) {
+      const stickToBottom = !scrollRef.current || isNearBottom(scrollRef.current);
+      if (!chatOpenedRef.current) {
+        requestParentOpen(`agent_message:${decision.openForIds[0]}`);
+      } else if (!stickToBottom) {
+        setUnseenBelow(true);
+      }
+    }
   }, []);
 
   const runCatchUp = useCallback(async (cid: string, tokenValue: string, signal?: AbortSignal): Promise<{ complete: boolean }> => {
@@ -319,13 +363,16 @@ function RealWidget() {
       chatOpened: chatOpenedRef.current,
       hostVisible: hostVisibleRef.current,
       getToken: () => tokenRef.current,
-      onSuccess: ({ initial, durationMs }) => {
+      onSuccess: ({ initial, durationMs, openConversationId }) => {
         setPresenceError(null);
         setPresenceRegistered(true);
         presenceDiagMark(
           "presence_ok",
           `${initial ? "initial" : "heartbeat"} · ${durationMs}ms`,
         );
+        if (openConversationId && !convRef.current && !attachingConvRef.current) {
+          void attachOpenConversationRef.current?.(openConversationId);
+        }
       },
       onError: (failure) => {
         void onPresenceFailure(failure);
@@ -336,6 +383,8 @@ function RealWidget() {
     setConversationId(null);
     setMsgs([]);
     setOlderCursor(null);
+    knownMsgIdsRef.current = new Set();
+    setUnseenBelow(false);
     syncWatermarkRef.current.reset(undefined);
 
     // Surface config failures after presence has already started.
@@ -349,6 +398,55 @@ function RealWidget() {
 
     return { token: sessionToken, conversationId: null as string | null };
   }, [clearVisitorIdentity, onPresenceFailure]);
+
+  const attachExistingConversation = useCallback(async (
+    sessionToken: string,
+    conversationIdValue: string,
+    opts?: { signal?: AbortSignal; autoOpenIfAgent?: boolean },
+  ): Promise<string> => {
+    if (convRef.current === conversationIdValue) return conversationIdValue;
+    const storage = storageRef.current ?? createSafeStorage();
+    storageRef.current = storage;
+    if (publicId) storage.setItem(CONV_KEY(publicId), conversationIdValue);
+    setConversationId(conversationIdValue);
+    const pageMsgs = await fetchVisitorMessages(sessionToken, conversationIdValue, {}, { signal: opts?.signal });
+    // Seed known IDs so history / reconnect catch-up does not spam auto-open.
+    const seeded = noteIncomingMessages(new Set(), pageMsgs.data, { seedOnly: true });
+    knownMsgIdsRef.current = seeded.knownIds;
+    setMsgs(pageMsgs.data);
+    setOlderCursor(pageMsgs.nextCursor);
+    syncWatermarkRef.current.reset(latestServerId(pageMsgs.data));
+
+    if (opts?.autoOpenIfAgent && !chatOpenedRef.current) {
+      const latestAgent = [...pageMsgs.data]
+        .reverse()
+        .find((m) => m.sender_type === "agent" || m.sender_type === "bot");
+      if (latestAgent) {
+        // Allow one open for this recovered agent message, then keep it known.
+        knownMsgIdsRef.current.delete(latestAgent.id);
+        const decision = noteIncomingMessages(knownMsgIdsRef.current, [latestAgent]);
+        knownMsgIdsRef.current = decision.knownIds;
+        if (decision.openForIds.length) {
+          requestParentOpen(`agent_thread:${latestAgent.id}`);
+        }
+      }
+    }
+    return conversationIdValue;
+  }, [publicId]);
+
+  const attachOpenConversationRef = useRef<((id: string) => Promise<void>) | null>(null);
+  attachOpenConversationRef.current = async (id: string) => {
+    const t = tokenRef.current;
+    if (!t || attachingConvRef.current || convRef.current) return;
+    attachingConvRef.current = true;
+    try {
+      await attachExistingConversation(t, id, { autoOpenIfAgent: true });
+    } catch (e) {
+      await handleApiFailureRef.current?.(e);
+    } finally {
+      attachingConvRef.current = false;
+    }
+  };
 
   const ensureConversation = useCallback(async (sessionToken: string, currentPage: string, signal?: AbortSignal): Promise<string> => {
     if (convRef.current) return convRef.current;
@@ -366,17 +464,15 @@ function RealWidget() {
       storageRef.current = storage;
       // POST resumes the latest open conversation or creates one — never from page visit alone.
       const conv = await createVisitorConversation(sessionToken, { page: sanitizePagePath(currentPage) }, { signal });
-      if (publicId) storage.setItem(CONV_KEY(publicId), conv.id);
-      setConversationId(conv.id);
-      const pageMsgs = await fetchVisitorMessages(sessionToken, conv.id, {}, { signal });
-      setMsgs(pageMsgs.data);
-      setOlderCursor(pageMsgs.nextCursor);
-      syncWatermarkRef.current.reset(latestServerId(pageMsgs.data));
-      return conv.id;
+      return await attachExistingConversation(
+        sessionToken,
+        conv.id,
+        signal ? { signal, autoOpenIfAgent: false } : { autoOpenIfAgent: false },
+      );
     } finally {
       ensuringConvRef.current = false;
     }
-  }, [publicId]);
+  }, [attachExistingConversation]);
 
   const renewSession = useCallback(async (reason: string) => {
     if (!publicId || renewingRef.current) return;
@@ -682,7 +778,17 @@ function RealWidget() {
     };
   }, [token, conversationId, applyIncoming, handleApiFailure, runCatchUp]);
 
-  useEffect(() => { end.current?.scrollIntoView({ block: "end" }); }, [msgs.length, pendingTick]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) {
+      end.current?.scrollIntoView({ block: "end" });
+      return;
+    }
+    if (isNearBottom(el) || !chatOpenedRef.current) {
+      end.current?.scrollIntoView({ block: "end" });
+      setUnseenBelow(false);
+    }
+  }, [msgs.length, pendingTick]);
 
   const loadOlder = async () => {
     if (!token || !conversationId || !olderCursor || loadingOlder) return;
@@ -692,6 +798,9 @@ function RealWidget() {
     try {
       const page = await fetchVisitorMessages(t, cid, { cursor: olderCursor });
       if (convRef.current !== cid) return;
+      // Pagination must not trigger auto-open.
+      const seeded = noteIncomingMessages(knownMsgIdsRef.current, page.data, { seedOnly: true });
+      knownMsgIdsRef.current = seeded.knownIds;
       setMsgs((prev) => mergeMessages(page.data, prev));
       setOlderCursor(page.nextCursor);
     } catch (e) {
@@ -822,6 +931,12 @@ function RealWidget() {
         onSend={(t) => void send(t)}
         onClose={closeParent}
         endRef={end}
+        scrollRef={scrollRef}
+        unseenBelow={unseenBelow}
+        onJumpToLatest={() => {
+          end.current?.scrollIntoView({ block: "end" });
+          setUnseenBelow(false);
+        }}
         emptyHints={msgs.length === 0 && pendingForActive.length === 0}
         greeting={config.greeting || `Hi there! Welcome to ${config.name}. How can we help today?`}
         messages={display}
@@ -831,7 +946,7 @@ function RealWidget() {
 }
 
 function WidgetChrome({
-  name, color, draft, setDraft, onSend, onClose, endRef, emptyHints, greeting, messages, status,
+  name, color, draft, setDraft, onSend, onClose, endRef, scrollRef, unseenBelow, onJumpToLatest, emptyHints, greeting, messages, status,
 }: {
   name: string;
   color: string;
@@ -840,31 +955,50 @@ function WidgetChrome({
   onSend: (text: string) => void;
   onClose: () => void;
   endRef: React.RefObject<HTMLDivElement | null>;
+  scrollRef?: React.RefObject<HTMLDivElement | null>;
+  unseenBelow?: boolean;
+  onJumpToLatest?: () => void;
   emptyHints: boolean;
   greeting: string;
   messages: { key: string; from: string; text: string; time?: string | undefined }[];
   status?: string | undefined;
 }) {
   return (
-    <div className="flex h-screen flex-col bg-card text-card-foreground">
-      <div className="flex items-center gap-3 p-4 text-primary-foreground" style={{ background: color }}>
+    <div className="flex h-dvh max-h-dvh flex-col bg-card text-card-foreground pb-[env(safe-area-inset-bottom,0px)]">
+      <div className="flex items-center gap-3 p-4 text-primary-foreground pt-[max(1rem,env(safe-area-inset-top,0px))]" style={{ background: color }}>
         <div className="flex size-9 items-center justify-center rounded-full bg-background/25 font-semibold">{name[0]}</div>
         <div>
           <p className="font-semibold">{name}</p>
           <p className="text-xs opacity-90">Chat with our team</p>
         </div>
-        <button aria-label="Close chat" className="ml-auto rounded p-1 hover:bg-background/20" onClick={onClose}><X className="size-5" /></button>
+        <button type="button" aria-label="Close chat" className="ml-auto rounded p-1 hover:bg-background/20" onClick={onClose}><X className="size-5" /></button>
       </div>
-      <div className="flex-1 space-y-3 overflow-y-auto bg-muted/30 p-4" aria-live="polite">
+      <div
+        ref={scrollRef}
+        className="relative flex-1 space-y-3 overflow-y-auto bg-muted/30 p-4"
+        aria-live="polite"
+        onScroll={(e) => {
+          if (isNearBottom(e.currentTarget) && unseenBelow) onJumpToLatest?.();
+        }}
+      >
         <Bubble from="bot" text={greeting} />
         {emptyHints && (
           <div className="flex flex-wrap gap-2">
-            {quick.map((q) => <button key={q} onClick={() => onSend(q)} className="rounded-full border bg-card px-3 py-1.5 text-sm hover:bg-muted">{q}</button>)}
+            {quick.map((q) => <button key={q} type="button" onClick={() => onSend(q)} className="rounded-full border bg-card px-3 py-1.5 text-sm hover:bg-muted">{q}</button>)}
           </div>
         )}
         {messages.map((m) => <Bubble key={m.key} from={m.from} text={m.text} time={m.time} />)}
         {status === "closed" && <p className="text-center text-xs text-muted-foreground">This chat was closed. Send a message to start again.</p>}
         <div ref={endRef} />
+        {unseenBelow && (
+          <button
+            type="button"
+            className="sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full border bg-card px-3 py-1.5 text-xs shadow"
+            onClick={onJumpToLatest}
+          >
+            New messages
+          </button>
+        )}
       </div>
       <form onSubmit={(e) => { e.preventDefault(); onSend(draft); }} className="flex gap-2 border-t p-3">
         <input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Type your message…" aria-label="Message" className="h-10 flex-1 rounded-full border bg-background px-4 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />

@@ -6,6 +6,8 @@ use App\Http\Controllers\Api\V1\ConversationController;
 use App\Http\Controllers\Api\V1\ConversationMessageController;
 use App\Http\Controllers\Api\V1\ConversationReadController;
 use App\Http\Controllers\Api\V1\LiveVisitorController;
+use App\Http\Controllers\Api\V1\LiveVisitorMessageController;
+use App\Http\Controllers\Api\V1\SavedReplyController;
 use App\Http\Controllers\Api\V1\Widget\BrandConfigController;
 use App\Http\Controllers\Api\V1\Widget\BroadcastAuthController;
 use App\Http\Controllers\Api\V1\Widget\ConversationController as WidgetConversationController;
@@ -34,6 +36,14 @@ Route::prefix('v1')->middleware(EnsureFrontendRequestsAreStateful::class)->group
         Route::patch('brands/{brand}', [BrandController::class, 'update'])->name('api.v1.brands.update');
 
         Route::get('live-visitors', [LiveVisitorController::class, 'index'])->name('api.v1.live-visitors.index');
+        Route::post('live-visitors/{visitor}/messages', [LiveVisitorMessageController::class, 'store'])
+            ->middleware('throttle:messages')
+            ->name('api.v1.live-visitors.messages.store');
+
+        Route::get('saved-replies', [SavedReplyController::class, 'index'])->name('api.v1.saved-replies.index');
+        Route::post('saved-replies', [SavedReplyController::class, 'store'])->name('api.v1.saved-replies.store');
+        Route::patch('saved-replies/{saved_reply}', [SavedReplyController::class, 'update'])->name('api.v1.saved-replies.update');
+        Route::delete('saved-replies/{saved_reply}', [SavedReplyController::class, 'destroy'])->name('api.v1.saved-replies.destroy');
 
         Route::get('conversations', [ConversationController::class, 'index'])->name('api.v1.conversations.index');
         Route::patch('conversations/{conversation}', [ConversationController::class, 'update'])->name('api.v1.conversations.update');

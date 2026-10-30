@@ -3,8 +3,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { PageHeader, Badge, Btn, Card, Table } from "@/components/app-shell";
 import { visitors as sampleVisitors } from "@/lib/sample-data";
 import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
-import { fetchBrands, fetchLiveVisitors, type ApiLiveVisitor } from "@/lib/chat-api";
+import {
+  fetchBrands,
+  fetchLiveVisitors,
+  fetchSavedReplies,
+  newClientMessageId,
+  postLiveVisitorMessage,
+  type ApiLiveVisitor,
+  type ApiSavedReply,
+} from "@/lib/chat-api";
+import { SlashReplyComposer } from "@/components/slash-reply-composer";
 import { parseBrandFilterId, useBrandFilter } from "@/lib/brand-filter";
+import { PendingSendRegistry } from "@/lib/message-utils";
 import {
   acquireAgentEcho,
   realtimeStatusLabel,
@@ -87,6 +97,12 @@ function RealLiveVisitors() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [realtime, setRealtime] = useState<RealtimeStatus>("connecting");
+  const [dmTarget, setDmTarget] = useState<LiveVisitor | null>(null);
+  const [dmDraft, setDmDraft] = useState("");
+  const [dmSending, setDmSending] = useState(false);
+  const [dmError, setDmError] = useState<string | null>(null);
+  const [dmReplies, setDmReplies] = useState<ApiSavedReply[]>([]);
+  const dmPendingRef = useRef(new PendingSendRegistry());
 
   const echoRef = useRef<EchoLike | null>(null);
   const echoReadyRef = useRef(false);
@@ -303,6 +319,42 @@ function RealLiveVisitors() {
     };
   }, [brandFilter, loadList, maybeStopListPolling, onPresencePayload, startListPolling]);
 
+  useEffect(() => {
+    if (!dmTarget) {
+      setDmReplies([]);
+      return;
+    }
+    const ac = new AbortController();
+    void fetchSavedReplies({ brand_id: dmTarget.brand_id, composer: true }, { signal: ac.signal })
+      .then(setDmReplies)
+      .catch((e) => {
+        if (!isAbortError(e)) setDmReplies([]);
+      });
+    return () => ac.abort();
+  }, [dmTarget?.brand_id, dmTarget?.visitor_id]);
+
+  const sendDm = async () => {
+    if (!dmTarget || !dmDraft.trim() || dmSending) return;
+    const text = dmDraft.trim();
+    const key = `visitor:${dmTarget.visitor_id}`;
+    const pending = dmPendingRef.current.ensure(key, text, "agent", newClientMessageId);
+    setDmSending(true);
+    setDmError(null);
+    setDmDraft("");
+    try {
+      await postLiveVisitorMessage(dmTarget.visitor_id, pending.clientMessageId, text, {
+        page: dmTarget.page,
+      });
+      dmPendingRef.current.confirm(key, pending.clientMessageId);
+    } catch (e) {
+      dmPendingRef.current.markFailed(key, pending.clientMessageId);
+      setDmDraft(text);
+      setDmError(e instanceof ApiError ? e.message : "Could not send message");
+    } finally {
+      setDmSending(false);
+    }
+  };
+
   return (
     <>
       <PageHeader
@@ -335,16 +387,66 @@ function RealLiveVisitors() {
               key="a"
               variant="outline"
               type="button"
-              disabled
-              title="Invite to chat is not available until end-to-end delivery is implemented."
+              onClick={() => {
+                setDmTarget(v);
+                setDmDraft("");
+                setDmError(null);
+              }}
             >
-              Invite to chat
+              Message
             </Btn>,
           ])}
         />
       )}
       {!loading && rows.length === 0 && !error && (
         <p className="mt-3 text-sm text-muted-foreground">No visitors are online for the selected brands.</p>
+      )}
+
+      {dmTarget && (
+        <Card className="mt-4 space-y-3 p-4">
+          <div role="dialog" aria-label={`Message ${dmTarget.label}`} className="contents">
+          <div className="flex items-start gap-3">
+            <div>
+              <p className="font-medium">Message {dmTarget.label}</p>
+              <p className="text-xs text-muted-foreground">
+                {dmTarget.brand_name ?? `Brand #${dmTarget.brand_id}`} · {dmTarget.page}
+              </p>
+            </div>
+            <Btn
+              variant="outline"
+              className="ml-auto"
+              type="button"
+              onClick={() => setDmTarget(null)}
+            >
+              Close
+            </Btn>
+          </div>
+          {dmError && <p className="text-sm text-destructive" role="alert">{dmError}</p>}
+          <form
+            className="flex flex-col gap-2 sm:flex-row sm:items-end"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void sendDm();
+            }}
+          >
+            <SlashReplyComposer
+              as="textarea"
+              value={dmDraft}
+              onChange={setDmDraft}
+              onSend={() => void sendDm()}
+              replies={dmReplies}
+              disabled={dmSending}
+              placeholder="Type a message, or / for saved replies"
+            />
+            <Btn type="submit" disabled={dmSending || !dmDraft.trim()}>
+              {dmSending ? "Sending…" : "Send"}
+            </Btn>
+          </form>
+          <p className="text-xs text-muted-foreground">
+            Starts or continues an open conversation. The visitor widget expands when a new agent message arrives (when the host page is active). Locked-screen delivery requires a separate push implementation.
+          </p>
+          </div>
+        </Card>
       )}
     </>
   );

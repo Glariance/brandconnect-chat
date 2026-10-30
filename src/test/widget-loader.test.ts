@@ -13,9 +13,20 @@ describe("widget.js loader hardening", () => {
     expect(source).toMatch(/e\.source\s*!==\s*frame\.contentWindow/);
   });
 
-  it("accepts structured close messages with an explicit source marker", () => {
+  it("accepts structured close and open messages with an explicit source marker", () => {
     expect(source).toMatch(/brandconnect-widget/);
     expect(source).toMatch(/bc:close/);
+    expect(source).toMatch(/bc:open/);
+    expect(source).toMatch(/isOpenMessage/);
+    expect(source).toMatch(/setOpen\(true/);
+  });
+
+  it("uses a mobile viewport panel with safe-area insets and never opens a new window", () => {
+    expect(source).toMatch(/isMobileViewport/);
+    expect(source).toMatch(/safe-area-inset/);
+    expect(source).toMatch(/85dvh/);
+    expect(source).not.toMatch(/window\.open/);
+    expect(source).toMatch(/Intentionally do not focus the iframe/);
   });
 
   it("boots presence without requiring the chat popup to open", () => {

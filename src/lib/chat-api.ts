@@ -63,6 +63,23 @@ export type ApiLiveVisitor = {
   chat_opened: boolean;
   tab_count: number;
   version: string;
+  /** Visitor heartbeat only — latest open conversation for agent-initiated DM discovery. */
+  open_conversation_id?: string | null;
+};
+
+export type ApiSavedReply = {
+  id: number;
+  organization_id: number;
+  brand_id: number | null;
+  brand_name?: string | null;
+  scope: "organization" | "brand";
+  title: string;
+  shortcut: string;
+  body: string;
+  is_active: boolean;
+  archived_at: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 export type CursorPage<T> = {
@@ -246,6 +263,66 @@ export async function fetchLiveVisitors(
   const qs = q.toString();
   const payload = await api(`/live-visitors${qs ? `?${qs}` : ""}`, { signal: opts.signal });
   return asCursorPage<ApiLiveVisitor>(payload);
+}
+
+export async function postLiveVisitorMessage(
+  visitorId: number,
+  clientMessageId: string,
+  text: string,
+  input: { page?: string } = {},
+  opts: RequestBase = {},
+): Promise<{ message: ApiMessage; conversation: ApiConversation }> {
+  const payload = await api(`/live-visitors/${visitorId}/messages`, {
+    method: "POST",
+    body: { client_message_id: clientMessageId, text, page: input.page },
+    signal: opts.signal,
+  });
+  return unwrapOne(payload);
+}
+
+export async function fetchSavedReplies(
+  params: {
+    brand_id?: number;
+    composer?: boolean;
+    q?: string;
+    include_archived?: boolean;
+  } = {},
+  opts: RequestBase = {},
+): Promise<ApiSavedReply[]> {
+  const q = new URLSearchParams();
+  if (params.brand_id) q.set("brand_id", String(params.brand_id));
+  if (params.composer) q.set("composer", "1");
+  if (params.q) q.set("q", params.q);
+  if (params.include_archived) q.set("include_archived", "1");
+  const qs = q.toString();
+  return unwrapList(await api(`/saved-replies${qs ? `?${qs}` : ""}`, { signal: opts.signal }));
+}
+
+export async function createSavedReply(input: {
+  title: string;
+  shortcut: string;
+  body: string;
+  brand_id?: number | null;
+  is_active?: boolean;
+}): Promise<ApiSavedReply> {
+  return unwrapOne(await api("/saved-replies", { method: "POST", body: input }));
+}
+
+export async function updateSavedReply(
+  id: number,
+  input: Partial<{
+    title: string;
+    shortcut: string;
+    body: string;
+    brand_id: number | null;
+    is_active: boolean;
+  }>,
+): Promise<ApiSavedReply> {
+  return unwrapOne(await api(`/saved-replies/${id}`, { method: "PATCH", body: input }));
+}
+
+export async function archiveSavedReply(id: number): Promise<void> {
+  await api(`/saved-replies/${id}`, { method: "DELETE" });
 }
 
 export async function createVisitorConversation(

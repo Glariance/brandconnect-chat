@@ -18,7 +18,7 @@ export const nav = [
   { to: "/brands", label: "Brands", icon: Building2 },
   { to: "/team", label: "Team", icon: UserCog },
   { to: "/automation", label: "Automation", icon: Workflow },
-  { to: "/canned-replies", label: "Canned Replies", icon: MessageSquareText },
+  { to: "/canned-replies", label: "Saved Replies", icon: MessageSquareText },
   { to: "/reports", label: "Reports", icon: BarChart3 },
   { to: "/integrations", label: "Integrations", icon: Plug },
   { to: "/audit-log", label: "Audit Log", icon: ScrollText },

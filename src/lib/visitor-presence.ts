@@ -62,7 +62,11 @@ export function startVisitorPresence(opts: {
   initialRetryMs?: readonly number[];
   /** Injected for tests. */
   postPresence?: typeof postVisitorPresence;
-  onSuccess?: (info: { initial: boolean; durationMs: number }) => void;
+  onSuccess?: (info: {
+    initial: boolean;
+    durationMs: number;
+    openConversationId?: string | null;
+  }) => void;
   onError?: (failure: PresenceFailure) => void;
 }): PresenceController {
   const tabId = newTabId();
@@ -111,7 +115,7 @@ export function startVisitorPresence(opts: {
     const wasRegistered = registered;
     const started = typeof performance !== "undefined" ? performance.now() : Date.now();
     try {
-      await post(t, {
+      const presence = await post(t, {
         tab_id: tabId,
         page,
         chat_opened: chatOpened,
@@ -123,7 +127,15 @@ export function startVisitorPresence(opts: {
       initialAttempt = 0;
       authRenewRequested = false;
       const ended = typeof performance !== "undefined" ? performance.now() : Date.now();
-      opts.onSuccess?.({ initial, durationMs: Math.round(ended - started) });
+      const openConversationId =
+        presence && typeof presence === "object" && "open_conversation_id" in presence
+          ? (presence as { open_conversation_id?: string | null }).open_conversation_id ?? null
+          : null;
+      opts.onSuccess?.({
+        initial,
+        durationMs: Math.round(ended - started),
+        openConversationId,
+      });
       if (!stopped && registered) scheduleNext(interval);
     } catch (error) {
       const base = classifyFailure(error);

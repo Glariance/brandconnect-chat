@@ -9,6 +9,7 @@ import {
   fetchAgentMessages,
   fetchBrands,
   fetchConversations,
+  fetchSavedReplies,
   formatMsgTime,
   markConversationRead,
   newClientMessageId,
@@ -17,7 +18,9 @@ import {
   type ApiBrand,
   type ApiConversation,
   type ApiMessage,
+  type ApiSavedReply,
 } from "@/lib/chat-api";
+import { SlashReplyComposer } from "@/components/slash-reply-composer";
 import {
   acquireAgentEcho,
   realtimeStatusLabel,
@@ -116,6 +119,7 @@ function RealInbox() {
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [draft, setDraft] = useState("");
+  const [savedReplies, setSavedReplies] = useState<ApiSavedReply[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -653,6 +657,21 @@ function RealInbox() {
   void pendingTick;
   const pendingForActive = conv.id ? pendingRef.current.listFor(conv.id) : [];
 
+  useEffect(() => {
+    const brandId = apiConv?.brand_id;
+    if (!brandId) {
+      setSavedReplies([]);
+      return;
+    }
+    const ac = new AbortController();
+    void fetchSavedReplies({ brand_id: brandId, composer: true }, { signal: ac.signal })
+      .then(setSavedReplies)
+      .catch((e) => {
+        if (!isAbortError(e)) setSavedReplies([]);
+      });
+    return () => ac.abort();
+  }, [apiConv?.brand_id]);
+
   const setDraftForActive = (value: string) => {
     if (active) draftsRef.current.set(active, value);
     setDraft(value);
@@ -757,6 +776,7 @@ function RealInbox() {
           onClose={() => void onClose()}
           onLoadOlder={olderCursor ? () => void loadOlder() : undefined}
           loadingOlder={loadingOlder}
+          savedReplies={savedReplies}
           visitorPreviewBrandId={
             apiConv?.brand?.public_id
             ?? rows.find((c) => c.brand?.public_id)?.brand?.public_id
@@ -772,7 +792,7 @@ function RealInbox() {
 }
 
 function InboxLayout({
-  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails, onLoadOlder, loadingOlder, visitorPreviewBrandId,
+  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails, onLoadOlder, loadingOlder, visitorPreviewBrandId, savedReplies = [],
 }: {
   tab: "open" | "pending" | "closed";
   setTab: (t: "open" | "pending" | "closed") => void;
@@ -787,6 +807,7 @@ function InboxLayout({
   sideDetails: string[][];
   onLoadOlder?: (() => void) | undefined;
   loadingOlder?: boolean | undefined;
+  savedReplies?: ApiSavedReply[];
   /** Real mode: API brand public_id. Demo mode: sample publicId. Null → link to Brands. */
   visitorPreviewBrandId?: string | null | undefined;
 }) {
@@ -869,7 +890,13 @@ function InboxLayout({
         <form onSubmit={(e) => { e.preventDefault(); onSend(); }} className="flex items-center gap-2 border-t p-3">
           <button type="button" aria-label="Attach" className="rounded p-2 hover:bg-muted"><Paperclip className="size-4" /></button>
           <button type="button" aria-label="Emoji" className="rounded p-2 hover:bg-muted"><Smile className="size-4" /></button>
-          <input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="Type a reply, or / for canned replies" className="h-9 flex-1 rounded-md border bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+          <SlashReplyComposer
+            value={draft}
+            onChange={setDraft}
+            onSend={onSend}
+            replies={savedReplies}
+            placeholder="Type a reply, or / for saved replies"
+          />
           <Btn type="submit"><Send className="size-4" />Send</Btn>
         </form>
       </Card>

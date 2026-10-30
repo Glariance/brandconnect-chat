@@ -54,8 +54,13 @@ Latest local run (system Edge / `channel: msedge`, origins `http://localhost:809
 | Reverb-outage browser disruption | — | **Not run** (shared `dev:all` stack; see PHPUnit `PresenceBroadcastResilienceTest`) |
 | Production CDN/proxy CSP preservation | — | **Not run** |
 | Real customer-host embedding | — | **Not run** |
+| Agent message auto-opens minimized widget (desktop) | Browser | Covered in `auto-open-and-slash.spec.ts` |
+| Mobile viewport open panel (Playwright emulation ≠ physical phone) | Browser emulation | Covered in `auto-open-and-slash.spec.ts` |
+| Slash menu Enter selects without send | Browser | Covered in `auto-open-and-slash.spec.ts` |
 
 Sanitized runner summary: `e2e/embed/.runtime/results.json` (gitignored).
+
+Also see `docs/SAVED_REPLIES.md` for saved-reply conflict rules and agent DM auto-open limits.
 
 ## Cleanup
 

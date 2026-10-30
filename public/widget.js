@@ -33,6 +33,14 @@
     }
   }
 
+  function isMobileViewport() {
+    try {
+      return window.matchMedia("(max-width: 640px)").matches;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function postToFrame(payload) {
     if (!frame || !frame.contentWindow) return;
     try {
@@ -84,27 +92,44 @@
   /**
    * Keep the iframe in the document and navigated on page load.
    * Closed chrome stays display:block (off-screen + opacity 0).
+   * Open mobile uses a viewport-bound panel with safe-area insets (no new window/tab).
+   * Never focuses the iframe inputs — avoids summoning the mobile keyboard.
    */
   function applyFrameChrome() {
     if (!frame) return;
     frame.style.position = "fixed";
-    frame.style.width = "370px";
-    frame.style.height = "540px";
-    frame.style.maxWidth = "calc(100vw - 40px)";
-    frame.style.maxHeight = "calc(100vh - 120px)";
     frame.style.border = "0";
-    frame.style.borderRadius = "16px";
     frame.style.zIndex = "2147483646";
     frame.style.background = "#fff";
     if (open) {
       frame.style.display = "block";
       frame.style.opacity = "1";
       frame.style.pointerEvents = "auto";
-      frame.style.bottom = "92px";
-      frame.style.right = "20px";
-      frame.style.left = "auto";
-      frame.style.top = "auto";
-      frame.style.boxShadow = "0 12px 40px rgba(0,0,0,.18)";
+      if (isMobileViewport()) {
+        frame.style.left = "0";
+        frame.style.right = "0";
+        frame.style.bottom = "0";
+        frame.style.top = "auto";
+        frame.style.width = "100%";
+        frame.style.height = "min(85dvh, calc(100dvh - env(safe-area-inset-top, 0px) - 12px))";
+        frame.style.maxWidth = "100%";
+        frame.style.maxHeight = "calc(100dvh - env(safe-area-inset-top, 0px) - 8px)";
+        frame.style.borderRadius = "16px 16px 0 0";
+        frame.style.paddingBottom = "env(safe-area-inset-bottom, 0px)";
+        frame.style.boxShadow = "0 -8px 32px rgba(0,0,0,.18)";
+      } else {
+        frame.style.width = "370px";
+        frame.style.height = "540px";
+        frame.style.maxWidth = "calc(100vw - 40px)";
+        frame.style.maxHeight = "calc(100vh - 120px)";
+        frame.style.borderRadius = "16px";
+        frame.style.paddingBottom = "0";
+        frame.style.bottom = "92px";
+        frame.style.right = "20px";
+        frame.style.left = "auto";
+        frame.style.top = "auto";
+        frame.style.boxShadow = "0 12px 40px rgba(0,0,0,.18)";
+      }
     } else {
       frame.style.display = "block";
       frame.style.opacity = "0";
@@ -113,8 +138,36 @@
       frame.style.top = "0";
       frame.style.bottom = "auto";
       frame.style.right = "auto";
+      frame.style.width = "370px";
+      frame.style.height = "540px";
+      frame.style.maxWidth = "calc(100vw - 40px)";
+      frame.style.maxHeight = "calc(100vh - 120px)";
+      frame.style.borderRadius = "16px";
+      frame.style.paddingBottom = "0";
       frame.style.boxShadow = "none";
     }
+  }
+
+  function setOpen(next, opts) {
+    opts = opts || {};
+    if (open === next) {
+      applyFrameChrome();
+      notifyChatState();
+      return;
+    }
+    open = next;
+    applyFrameChrome();
+    if (btn) {
+      btn.innerHTML = open ? closeIcon : chatIcon;
+      btn.setAttribute("aria-label", open ? "Close chat" : "Open chat");
+    }
+    if (open) {
+      postToFrame({ type: "bc:parent-origin", parentOrigin: parentOrigin });
+    }
+    notifyChatState();
+    notifyHostVisibility();
+    if (widgetReady) replayHostState();
+    // Intentionally do not focus the iframe — preserves draft without summoning mobile keyboard.
   }
 
   function patchHistoryOnce() {
@@ -154,6 +207,20 @@
     );
   }
 
+  function isOpenMessage(data) {
+    return !!(
+      data &&
+      typeof data === "object" &&
+      data.type === "bc:open" &&
+      data.source === "brandconnect-widget"
+    );
+  }
+
+  var chatIcon =
+    '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
+  var closeIcon =
+    '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+
   function boot() {
     if (window.__bcWidgetBooted) return;
     window.__bcWidgetBooted = true;
@@ -177,24 +244,11 @@
     btn = document.createElement("button");
     btn.setAttribute("aria-label", "Open chat");
     btn.style.cssText =
-      "position:fixed;bottom:20px;right:20px;width:60px;height:60px;border-radius:50%;border:0;cursor:pointer;z-index:2147483647;box-shadow:0 6px 20px rgba(0,0,0,.2);color:#fff;background:" +
+      "position:fixed;bottom:max(20px, env(safe-area-inset-bottom, 0px));right:max(20px, env(safe-area-inset-right, 0px));width:60px;height:60px;border-radius:50%;border:0;cursor:pointer;z-index:2147483647;box-shadow:0 6px 20px rgba(0,0,0,.2);color:#fff;background:" +
       color;
-    var chatIcon =
-      '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
-    var closeIcon =
-      '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>';
     btn.innerHTML = chatIcon;
     btn.onclick = function () {
-      open = !open;
-      applyFrameChrome();
-      btn.innerHTML = open ? closeIcon : chatIcon;
-      btn.setAttribute("aria-label", open ? "Close chat" : "Open chat");
-      if (open) {
-        postToFrame({ type: "bc:parent-origin", parentOrigin: parentOrigin });
-      }
-      notifyChatState();
-      notifyHostVisibility();
-      if (widgetReady) replayHostState();
+      setOpen(!open);
     };
 
     window.addEventListener("message", function (e) {
@@ -205,13 +259,24 @@
         replayHostState();
         return;
       }
+      if (isOpenMessage(e.data)) {
+        setOpen(true, { fromAgent: true });
+        return;
+      }
       if (!isCloseMessage(e.data)) return;
-      if (open) btn.onclick();
+      if (open) setOpen(false);
     });
 
     document.addEventListener("visibilitychange", function () {
       notifyHostVisibility();
       if (widgetReady) replayHostState();
+    });
+
+    window.addEventListener("resize", function () {
+      if (open) applyFrameChrome();
+    });
+    window.addEventListener("orientationchange", function () {
+      if (open) applyFrameChrome();
     });
 
     function append() {
