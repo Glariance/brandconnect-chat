@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Embed fixture · __LABEL__</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; }
+      #status { margin-top: 1rem; font-size: 0.9rem; color: #333; }
+    </style>
+  </head>
+  <body>
+    <h1 data-testid="fixture-title">__LABEL__ parent</h1>
+    <p>Fixture host for BrandConnect embed acceptance tests.</p>
+    <div id="status" data-testid="fixture-status">loading</div>
+    <script>
+      window.__bcEmbedFixture = {
+        label: "__LABEL__",
+        origin: location.origin,
+        frameBlocked: false,
+        securityErrors: [],
+      };
+      window.addEventListener("securitypolicyviolation", (e) => {
+        window.__bcEmbedFixture.frameBlocked = true;
+        window.__bcEmbedFixture.securityErrors.push({
+          violatedDirective: e.violatedDirective,
+          effectiveDirective: e.effectiveDirective,
+          blockedURI: e.blockedURI,
+        });
+        document.getElementById("status").textContent = "csp-violation";
+      });
+      // Observe iframe load / access failures (cross-origin / blocked frame).
+      document.addEventListener("DOMContentLoaded", () => {
+        document.getElementById("status").textContent = "ready";
+      });
+    </script>
+    <script
+      src="__WIDGET_ORIGIN__/widget.js"
+      data-brand-id="__BRAND_PUBLIC_ID__"
+      data-color="#0f766e"
+      defer
+    ></script>
+  </body>
+</html>

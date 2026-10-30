@@ -13,7 +13,9 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "node scripts/run-vitest.mjs run",
-    "test:watch": "node scripts/run-vitest.mjs"
+    "test:watch": "node scripts/run-vitest.mjs",
+    "test:e2e:embed": "node e2e/embed/run.mjs",
+    "test:e2e:embed:setup": "node e2e/embed/setup.mjs"
   },
   "overrides": {
     "rolldown": "1.2.1"
@@ -77,6 +79,7 @@
   "devDependencies": {
     "@eslint/js": "^9.32.0",
     "@lovable.dev/vite-tanstack-config": "2.26.5",
+    "@playwright/test": "^1.64.1",
     "@testing-library/jest-dom": "^6.6.0",
     "@testing-library/react": "^16.0.0",
     "@types/node": "^22.16.5",
@@ -91,6 +94,7 @@
     "globals": "^15.15.0",
     "jsdom": "^20.0.3",
     "nitro": "3.0.260603-beta",
+    "playwright": "^1.64.1",
     "prettier": "^3.7.3",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.56.1",
