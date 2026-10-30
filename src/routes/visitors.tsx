@@ -1,6 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PageHeader, Badge, Btn, Card, Table } from "@/components/app-shell";
+import { AgentComposer } from "@/components/agent-composer";
+import { VisitorArrivalControls } from "@/components/visitor-arrival-controls";
 import { visitors as sampleVisitors } from "@/lib/sample-data";
 import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
 import {
@@ -12,9 +14,10 @@ import {
   type ApiLiveVisitor,
   type ApiSavedReply,
 } from "@/lib/chat-api";
-import { SlashReplyComposer } from "@/components/slash-reply-composer";
 import { parseBrandFilterId, useBrandFilter } from "@/lib/brand-filter";
 import { PendingSendRegistry } from "@/lib/message-utils";
+import { announceVisitorArrival } from "@/lib/visitor-arrival-notify";
+import { createVisitorArrivalTracker } from "@/lib/visitor-arrival-tracker";
 import {
   acquireAgentEcho,
   realtimeStatusLabel,
@@ -66,7 +69,9 @@ function DemoLiveVisitors() {
           v.source,
           <div key="a" className="flex justify-end gap-2">
             {v.returning && <Badge tone="primary">Returning</Badge>}
-            <Btn variant="outline">Invite to chat</Btn>
+            <Btn variant="outline" disabled title="Demo mode">
+              Message
+            </Btn>
           </div>,
         ])}
       />
@@ -103,6 +108,9 @@ function RealLiveVisitors() {
   const [dmError, setDmError] = useState<string | null>(null);
   const [dmReplies, setDmReplies] = useState<ApiSavedReply[]>([]);
   const dmPendingRef = useRef(new PendingSendRegistry());
+  const arrivalTrackerRef = useRef(createVisitorArrivalTracker());
+  /** Skip alerts until first successful hydrate for the current filter. */
+  const baselineReadyRef = useRef(false);
 
   const echoRef = useRef<EchoLike | null>(null);
   const echoReadyRef = useRef(false);
@@ -123,7 +131,13 @@ function RealLiveVisitors() {
     listPollStopRef.current = null;
   }, []);
 
-  const loadList = useCallback(async (opts?: { mergeLive?: boolean }) => {
+  const announceArrivals = useCallback((arrivals: LiveVisitor[]) => {
+    for (const v of arrivals) {
+      void announceVisitorArrival(v);
+    }
+  }, []);
+
+  const loadList = useCallback(async (opts?: { mergeLive?: boolean; seedBaseline?: boolean }) => {
     listAbortRef.current?.abort();
     const ac = new AbortController();
     listAbortRef.current = ac;
@@ -134,7 +148,18 @@ function RealLiveVisitors() {
       const page = await fetchLiveVisitors(params, { signal: ac.signal });
       if (ac.signal.aborted) return false;
       const http = page.data.map(toLive);
-      setRows((prev) => (opts?.mergeLive ? mergePresenceLists(http, prev, filters) : mergePresenceLists(http, [], filters)));
+      const merged = opts?.mergeLive
+        ? mergePresenceLists(http, rowsRef.current, filters)
+        : mergePresenceLists(http, [], filters);
+      setRows(merged);
+
+      if (opts?.seedBaseline || !baselineReadyRef.current) {
+        arrivalTrackerRef.current.resetBaseline(merged);
+        baselineReadyRef.current = true;
+      } else {
+        announceArrivals(arrivalTrackerRef.current.noteRows(merged));
+      }
+
       setError(null);
       return true;
     } catch (e) {
@@ -150,7 +175,7 @@ function RealLiveVisitors() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [announceArrivals]);
 
   const startListPolling = useCallback(() => {
     if (listPollStopRef.current) return;
@@ -164,8 +189,6 @@ function RealLiveVisitors() {
     const all =
       expected.length > 0 && expected.every((id) => subscribedBrandIdsRef.current.has(id));
     if (!all) return;
-    // Mark live as soon as every brand channel is subscribed; keep HTTP polling
-    // until the authoritative list reconcile finishes.
     setRealtime((s) => (s === "polling" || s === "connecting" ? "live" : s));
     if (reconciledRef.current) stopListPolling();
   }, [stopListPolling]);
@@ -174,12 +197,17 @@ function RealLiveVisitors() {
     const parsed = liveVisitorFromBroadcast(payload);
     if (!parsed) return;
     setRows((prev) => applyPresenceUpdate(prev, parsed.visitor, parsed.reason, filtersRef.current));
+    if (!baselineReadyRef.current) return;
+    const arrival = arrivalTrackerRef.current.noteUpdate(parsed.visitor, parsed.reason);
+    if (arrival) void announceVisitorArrival(arrival);
   }, []);
 
   useEffect(() => {
     setLoading(true);
     reconciledRef.current = false;
-    void loadList({ mergeLive: false }).then((ok) => {
+    baselineReadyRef.current = false;
+    arrivalTrackerRef.current = createVisitorArrivalTracker();
+    void loadList({ mergeLive: false, seedBaseline: true }).then((ok) => {
       if (ok) {
         reconciledRef.current = true;
         maybeStopListPolling();
@@ -199,24 +227,24 @@ function RealLiveVisitors() {
     void acquireAgentEcho()
       .then((echo) => {
         if (cancelled) {
-          releaseAgentEcho();
+          if (echo) releaseAgentEcho();
           return;
         }
         echoRef.current = echo;
-        echoReadyRef.current = true;
-        setRealtime(echo ? "connecting" : "polling");
-        if (!echo) startListPolling();
+        echoReadyRef.current = Boolean(echo);
+        if (!echo) {
+          startListPolling();
+          setRealtime("polling");
+        }
       })
       .catch(() => {
-        if (cancelled) return;
-        echoRef.current = null;
-        echoReadyRef.current = true;
-        setRealtime("polling");
-        startListPolling();
+        if (!cancelled) {
+          startListPolling();
+          setRealtime("polling");
+        }
       });
     return () => {
       cancelled = true;
-      stopListPolling();
       for (const sub of subsRef.current) sub.leave();
       subsRef.current = [];
       subscribedBrandIdsRef.current.clear();
@@ -224,7 +252,9 @@ function RealLiveVisitors() {
       echoRef.current = null;
       echoReadyRef.current = false;
     };
-  }, [startListPolling, stopListPolling]);
+    // Echo is acquired once for the Live Visitors mount; brand filters re-subscribe separately.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -294,13 +324,11 @@ function RealLiveVisitors() {
                 reconciledRef.current = true;
                 maybeStopListPolling();
               } else {
-                // Keep other brand sockets; only poll while reconcile is unhealthy.
                 startListPolling();
               }
             })();
           },
           onSubscriptionError: () => {
-            // One brand auth failure must not drop healthy sibling subscriptions.
             subscribedBrandIdsRef.current.delete(id);
             startListPolling();
           },
@@ -361,6 +389,7 @@ function RealLiveVisitors() {
         title="Live Visitors"
         desc={`${rows.length} visitor${rows.length === 1 ? "" : "s"} online now`}
       />
+      <VisitorArrivalControls />
       <p className="mb-2 text-xs text-muted-foreground" role="status">{realtimeStatusLabel(realtime)}</p>
       {error && (
         <div className="mb-3 flex items-center gap-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive" role="alert">
@@ -403,50 +432,19 @@ function RealLiveVisitors() {
       )}
 
       {dmTarget && (
-        <Card className="mt-4 space-y-3 p-4">
-          <div role="dialog" aria-label={`Message ${dmTarget.label}`} className="contents">
-          <div className="flex items-start gap-3">
-            <div>
-              <p className="font-medium">Message {dmTarget.label}</p>
-              <p className="text-xs text-muted-foreground">
-                {dmTarget.brand_name ?? `Brand #${dmTarget.brand_id}`} · {dmTarget.page}
-              </p>
-            </div>
-            <Btn
-              variant="outline"
-              className="ml-auto"
-              type="button"
-              onClick={() => setDmTarget(null)}
-            >
-              Close
-            </Btn>
-          </div>
-          {dmError && <p className="text-sm text-destructive" role="alert">{dmError}</p>}
-          <form
-            className="flex flex-col gap-2 sm:flex-row sm:items-end"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void sendDm();
-            }}
-          >
-            <SlashReplyComposer
-              as="textarea"
-              value={dmDraft}
-              onChange={setDmDraft}
-              onSend={() => void sendDm()}
-              replies={dmReplies}
-              disabled={dmSending}
-              placeholder="Type a message, or / for saved replies"
-            />
-            <Btn type="submit" disabled={dmSending || !dmDraft.trim()}>
-              {dmSending ? "Sending…" : "Send"}
-            </Btn>
-          </form>
-          <p className="text-xs text-muted-foreground">
-            Starts or continues an open conversation. The visitor widget expands when a new agent message arrives (when the host page is active). Locked-screen delivery requires a separate push implementation.
-          </p>
-          </div>
-        </Card>
+        <div className="mt-4 max-w-3xl" data-testid="agent-dm-composer">
+          <AgentComposer
+            title={dmTarget.label}
+            subtitle={`${dmTarget.brand_name ?? `Brand #${dmTarget.brand_id}`} · ${dmTarget.page}`}
+            onClose={() => setDmTarget(null)}
+            value={dmDraft}
+            onChange={setDmDraft}
+            onSend={() => void sendDm()}
+            replies={dmReplies}
+            sending={dmSending}
+            error={dmError}
+          />
+        </div>
       )}
     </>
   );

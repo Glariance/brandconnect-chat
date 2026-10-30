@@ -93,7 +93,7 @@ test.describe("approved embedding — real browser", () => {
     await conv.click({ timeout: 15_000 }).catch(() => undefined);
 
     const reply = `agent-reply-${unique}`;
-    const agentComposer = agent.getByPlaceholder("Type a reply, or / for saved replies");
+    const agentComposer = agent.getByPlaceholder(/Write a reply|saved replies/i);
     await agentComposer.waitFor({ state: "visible", timeout: 30_000 });
     await agentComposer.fill(reply);
     await agent.getByRole("button", { name: /send/i }).click();

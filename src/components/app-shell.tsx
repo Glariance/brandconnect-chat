@@ -9,6 +9,7 @@ import { useAuth } from "@/lib/auth";
 import { ApiError, isRealChatEnabled } from "@/lib/api";
 import { fetchBrands, type ApiBrand } from "@/lib/chat-api";
 import { BrandFilterProvider } from "@/lib/brand-filter";
+import { Toaster } from "@/components/ui/sonner";
 
 export const nav = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
@@ -134,6 +135,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </header>
         <main className="flex-1 p-4 md:p-6">{children}</main>
       </div>
+      <Toaster position="top-right" richColors closeButton />
     </div>
     </BrandFilterProvider>
   );

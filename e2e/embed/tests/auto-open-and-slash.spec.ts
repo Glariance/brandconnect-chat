@@ -11,6 +11,7 @@ test.describe("auto-open and slash replies (browser)", () => {
   test("agent message expands a minimized desktop widget without focusing composer", async ({
     browser,
   }) => {
+    test.setTimeout(180_000);
     const visitorCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
     const agentCtx = await browser.newContext();
     const visitor = await visitorCtx.newPage();
@@ -21,10 +22,14 @@ test.describe("auto-open and slash replies (browser)", () => {
     await waitForHydratedWidgetIframe(visitor);
 
     // Ensure a conversation exists first (visitor message), then minimize.
+    const seed = `open-seed-${Date.now()}`;
     await visitor.getByRole("button", { name: "Open chat" }).click();
     const iframe = visitor.frameLocator('iframe[title="Chat with us"]');
-    await iframe.getByLabel("Message").fill(`open-seed-${Date.now()}`);
+    await iframe.getByLabel("Message").fill(seed);
     await iframe.getByRole("button", { name: "Send" }).click();
+    await expect.poll(async () => (await iframe.locator("body").innerText()).includes(seed), {
+      timeout: 45_000,
+    }).toBe(true);
     await visitor.getByRole("button", { name: "Close chat" }).click();
 
     // Confirm minimized (launcher shows Open chat).
@@ -32,15 +37,18 @@ test.describe("auto-open and slash replies (browser)", () => {
 
     await agent.goto(`${env.frontendOrigin}/inbox`, { waitUntil: "domcontentloaded" });
     const unique = `agent-auto-open-${Date.now()}`;
-    await expect.poll(async () => (await agent.locator("body").innerText()).length > 20, {
+    // Select the conversation that contains the visitor seed (not an older thread).
+    await expect.poll(async () => (await agent.locator("body").innerText()).includes(seed), {
       timeout: 60_000,
     }).toBe(true);
-    // Select first conversation and reply.
-    await agent.locator("ul li button").first().click({ timeout: 30_000 }).catch(() => undefined);
-    const composer = agent.getByPlaceholder("Type a reply, or / for saved replies");
+    await agent.getByText(seed).first().click({ timeout: 30_000 });
+    const composer = agent.getByTestId("inbox-agent-composer").locator("textarea");
     await composer.waitFor({ state: "visible", timeout: 30_000 });
     await composer.fill(unique);
-    await agent.getByRole("button", { name: /send/i }).click();
+    await agent.getByTestId("inbox-agent-composer").getByRole("button", { name: /^Send$/ }).click();
+    await expect.poll(async () => (await agent.locator("body").innerText()).includes(unique), {
+      timeout: 45_000,
+    }).toBe(true);
 
     // Widget should expand from iframe bc:open without visitor clicking.
     await expect.poll(async () => {
@@ -109,12 +117,13 @@ test.describe("auto-open and slash replies (browser)", () => {
 
     await agent.goto(`${env.frontendOrigin}/inbox`, { waitUntil: "domcontentloaded" });
     await agent.locator("ul li button").first().click({ timeout: 30_000 }).catch(() => undefined);
-    const composer = agent.getByPlaceholder("Type a reply, or / for saved replies");
+    const composer = agent.getByPlaceholder(/Write a reply|saved replies/i);
     await composer.waitFor({ state: "visible", timeout: 45_000 });
     await composer.fill("");
-    await composer.type(shortcut.slice(0, 3), { delay: 40 });
-    // Menu should appear; Enter selects.
+    // Type the full unique shortcut so prior e2e replies do not steal selection.
+    await composer.type(shortcut, { delay: 25 });
     await expect(agent.getByRole("listbox", { name: "Saved replies" })).toBeVisible({ timeout: 15_000 });
+    await expect(agent.getByRole("option").filter({ hasText: body })).toBeVisible();
     await composer.press("Enter");
     await expect(composer).toHaveValue(body);
     // Message not sent solely from Enter selection.

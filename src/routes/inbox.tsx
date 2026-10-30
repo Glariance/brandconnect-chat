@@ -1,7 +1,8 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Send, Paperclip, Smile, Bot, Radio } from "lucide-react";
+import { Bot, Radio } from "lucide-react";
 import { Card, Badge, Btn } from "@/components/app-shell";
+import { AgentComposer } from "@/components/agent-composer";
 import { brands as sampleBrands, conversations, messages } from "@/lib/sample-data";
 import { addMessage, closeConv, markRead, now, useLiveChats } from "@/lib/chat-store";
 import { ApiError, isAbortError, isRealChatEnabled } from "@/lib/api";
@@ -20,7 +21,6 @@ import {
   type ApiMessage,
   type ApiSavedReply,
 } from "@/lib/chat-api";
-import { SlashReplyComposer } from "@/components/slash-reply-composer";
 import {
   acquireAgentEcho,
   realtimeStatusLabel,
@@ -776,6 +776,8 @@ function RealInbox() {
           onClose={() => void onClose()}
           onLoadOlder={olderCursor ? () => void loadOlder() : undefined}
           loadingOlder={loadingOlder}
+          sending={sending}
+          error={error}
           savedReplies={savedReplies}
           visitorPreviewBrandId={
             apiConv?.brand?.public_id
@@ -792,7 +794,7 @@ function RealInbox() {
 }
 
 function InboxLayout({
-  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails, onLoadOlder, loadingOlder, visitorPreviewBrandId, savedReplies = [],
+  tab, setTab, shown, conv, setActive, msgs, draft, setDraft, onSend, onClose, sideDetails, onLoadOlder, loadingOlder, visitorPreviewBrandId, savedReplies = [], sending = false, error = null,
 }: {
   tab: "open" | "pending" | "closed";
   setTab: (t: "open" | "pending" | "closed") => void;
@@ -807,6 +809,8 @@ function InboxLayout({
   sideDetails: string[][];
   onLoadOlder?: (() => void) | undefined;
   loadingOlder?: boolean | undefined;
+  sending?: boolean;
+  error?: string | null;
   savedReplies?: ApiSavedReply[];
   /** Real mode: API brand public_id. Demo mode: sample publicId. Null → link to Brands. */
   visitorPreviewBrandId?: string | null | undefined;
@@ -887,18 +891,19 @@ function InboxLayout({
             </div>
           ))}
         </div>
-        <form onSubmit={(e) => { e.preventDefault(); onSend(); }} className="flex items-center gap-2 border-t p-3">
-          <button type="button" aria-label="Attach" className="rounded p-2 hover:bg-muted"><Paperclip className="size-4" /></button>
-          <button type="button" aria-label="Emoji" className="rounded p-2 hover:bg-muted"><Smile className="size-4" /></button>
-          <SlashReplyComposer
+        <div className="border-t p-2" data-testid="inbox-agent-composer">
+          <AgentComposer
+            embedded
+            title={conv.name}
             value={draft}
             onChange={setDraft}
             onSend={onSend}
             replies={savedReplies}
-            placeholder="Type a reply, or / for saved replies"
+            sending={sending}
+            error={error}
+            placeholder="Write a reply… Type / for saved replies"
           />
-          <Btn type="submit"><Send className="size-4" />Send</Btn>
-        </form>
+        </div>
       </Card>
       <Card className="hidden space-y-4 p-4 text-sm xl:block">
         <h2 className="font-medium">Visitor details</h2>
