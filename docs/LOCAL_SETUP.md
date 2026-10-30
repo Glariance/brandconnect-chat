@@ -40,7 +40,7 @@ cd D:\laragon\www\awsodesk
 npm run dev:all
 ```
 
-- Logs are prefixed `[FRONTEND]`, `[API]`, `[REVERB]`, `[QUEUE]` (plus `[LAUNCHER]` status).
+- Logs are prefixed `[FRONTEND]`, `[API-PROXY]`, `[API-8011]`…, `[REVERB]`, `[QUEUE]` (plus `[LAUNCHER]` status).
 - “Starting” means the child process was spawned; “READY” means HTTP (API/frontend) or TCP (Reverb) checks passed. Queue “running” does **not** prove message delivery.
 - Stop with **Ctrl+C** in that terminal — the launcher terminates its process tree (including Windows child processes) and removes `.dev-all.lock`.
 - From another terminal: `npm run dev:all:stop` (writes `.dev-all.stop` for a graceful shutdown, then force-cleans lock children if needed).
@@ -48,7 +48,7 @@ npm run dev:all
 
 ### Port conflicts
 
-If 8000 / 8080 / 8081 is already taken, `dev:all` **exits with instructions** and does **not** kill the existing process. Free the port yourself (or stop a previous stack), then retry.
+If 8000 / 8011–8013 / 8080 / 8081 is already taken, `dev:all` **exits with instructions** and does **not** kill the existing process. Free the port yourself (or stop a previous stack), then retry.
 
 ### Duplicate launchers
 
@@ -204,13 +204,16 @@ On one local diagnose pass with Reverb + `queue:work --sleep=1` already running:
 | Stage | Observed |
 |-------|----------|
 | In-process CSRF + `/auth/me` + conversations + messages | ~184ms sum |
-| HTTP Sanctum CSRF (cold, via `artisan serve`) | ~0.7–1.0s |
+| HTTP Sanctum CSRF (cold, via `artisan serve` worker) | ~0.7–1.0s |
 | WS handshake / socket connected | ~10–20ms once Reverb is up |
-| Visitor broadcasting auth | ~0.4–2.0s depending on `artisan serve` load |
+| Visitor broadcasting auth | ~0.4–2.0s when a single worker is saturated |
 | `MessageCreated` queue job | ~230–300ms |
 | HTTP 201 → `.message.created` WS frame | ~0.5–0.6s in that run |
+| Widget config / session / presence (individual, warm worker) | ~0.7–1.5s HTTP each; in-process Laravel ~10–140ms after boot |
+| Five parallel configs on one `artisan serve` | wall ~4.4s (serialized ~0.5s steps) |
+| Same pattern via `dev:all` multi-worker proxy | wall ≈ single-request latency |
 
-`php artisan serve` is single-threaded; overlapping browser requests stretch wall-clock time. History HTTP loads do **not** wait for Echo subscription — transcript fetch starts as soon as a conversation is selected.
+`php artisan serve` is single-threaded. `npm run dev:all` runs **three** workers (`8011`–`8013`) behind a Node reverse proxy on **8000** so Live Visitors polling does not block widget bootstrap. Presence broadcasts use `ShouldBroadcastNow` (no queue sleep). History HTTP loads do **not** wait for Echo subscription — transcript fetch starts as soon as a conversation is selected.
 
 ## Visitor storage note
 

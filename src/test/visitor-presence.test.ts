@@ -50,6 +50,7 @@ describe("startVisitorPresence registration", () => {
     await Promise.resolve();
     expect(posts.length).toBe(2);
     expect(onSuccess).toHaveBeenCalled();
+    expect(onSuccess.mock.calls.at(-1)?.[0]).toMatchObject({ initial: true, durationMs: expect.any(Number) });
     expect(ctl.registered).toBe(true);
 
     ctl.stop();

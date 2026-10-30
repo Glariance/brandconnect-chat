@@ -4,15 +4,18 @@ namespace App\Events;
 
 use Illuminate\Broadcasting\InteractsWithSockets;
 use Illuminate\Broadcasting\PrivateChannel;
-use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
 use Illuminate\Contracts\Events\ShouldDispatchAfterCommit;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
 /**
  * Brand-scoped live visitor presence for dashboard agents.
+ *
+ * Broadcast synchronously (ShouldBroadcastNow) so Live Visitors is not delayed
+ * by the queue worker sleep interval used for chat message fan-out.
  */
-class VisitorPresenceUpdated implements ShouldBroadcast, ShouldDispatchAfterCommit
+class VisitorPresenceUpdated implements ShouldBroadcastNow, ShouldDispatchAfterCommit
 {
     use Dispatchable, InteractsWithSockets, SerializesModels;
 

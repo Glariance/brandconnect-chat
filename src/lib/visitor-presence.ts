@@ -62,7 +62,7 @@ export function startVisitorPresence(opts: {
   initialRetryMs?: readonly number[];
   /** Injected for tests. */
   postPresence?: typeof postVisitorPresence;
-  onSuccess?: (info: { initial: boolean }) => void;
+  onSuccess?: (info: { initial: boolean; durationMs: number }) => void;
   onError?: (failure: PresenceFailure) => void;
 }): PresenceController {
   const tabId = newTabId();
@@ -109,6 +109,7 @@ export function startVisitorPresence(opts: {
     if (!t) return;
     inFlight = true;
     const wasRegistered = registered;
+    const started = typeof performance !== "undefined" ? performance.now() : Date.now();
     try {
       await post(t, {
         tab_id: tabId,
@@ -121,7 +122,8 @@ export function startVisitorPresence(opts: {
       registered = true;
       initialAttempt = 0;
       authRenewRequested = false;
-      opts.onSuccess?.({ initial });
+      const ended = typeof performance !== "undefined" ? performance.now() : Date.now();
+      opts.onSuccess?.({ initial, durationMs: Math.round(ended - started) });
       if (!stopped && registered) scheduleNext(interval);
     } catch (error) {
       const base = classifyFailure(error);

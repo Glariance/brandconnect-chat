@@ -31,8 +31,7 @@ const listeners = new Set<() => void>();
 export function presenceDiagEnabled(searchDiag?: string | boolean | null): boolean {
   if (searchDiag === true || searchDiag === "1" || searchDiag === "true") return true;
   try {
-    const viteEnv = (import.meta as ImportMeta & { env?: Record<string, boolean | string | undefined> }).env;
-    return Boolean(viteEnv?.DEV);
+    return Boolean(import.meta.env.DEV);
   } catch {
     return false;
   }

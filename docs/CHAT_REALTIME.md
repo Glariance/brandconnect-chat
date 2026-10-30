@@ -67,7 +67,8 @@ Presence is **independent of conversations**.
 | Conversation | Created/resumed on first visitor message (or when the popup opens with a stored conversation id) |
 | Heartbeat | `POST /api/v1/widget/presence` immediately, then about every **25s** while the **host** page is visible (`bc:host-visibility` / `bc:host-state`). Failed **initial** registration uses short bounded backoff and surfaces errors to the widget; auth expiry renews the visitor session once (no retry spin). Do not use the iframe document’s Page Visibility API — a closed panel must not mark the visitor offline |
 | Handshake | Iframe posts `bc:widget-ready` after its message listener is installed; loader replies with `bc:host-state` (page, open, visible). Load listeners are registered before `iframe.src` is assigned |
-| Diagnostics | Append `?diag=1` on the brand page (propagated into the iframe) or open `/widget?...&diag=1` in DEV to see stage timings without tokens |
+| Diagnostics | Append `?diag=1` on the brand page (propagated into the iframe) or open `/widget?...&diag=1` in DEV to see stage timings (including per-request ms) without tokens |
+| Broadcast | `presence.updated` uses `ShouldBroadcastNow` (skips queue worker sleep); dashboard keeps HTTP list polling as fallback |
 | Fields | `tab_id` (per tab), sanitized `page` (path only), `chat_opened`, `activity` |
 | Active | Online and `last_activity_at` within **60s** |
 | Idle | Online (heartbeat within **90s**) without recent activity |

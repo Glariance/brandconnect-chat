@@ -147,10 +147,11 @@ function RealLiveVisitors() {
     const expected = expectedBrandIdsRef.current;
     const all =
       expected.length > 0 && expected.every((id) => subscribedBrandIdsRef.current.has(id));
-    if (all && reconciledRef.current) {
-      stopListPolling();
-      setRealtime((s) => (s === "polling" || s === "connecting" ? "live" : s));
-    }
+    if (!all) return;
+    // Mark live as soon as every brand channel is subscribed; keep HTTP polling
+    // until the authoritative list reconcile finishes.
+    setRealtime((s) => (s === "polling" || s === "connecting" ? "live" : s));
+    if (reconciledRef.current) stopListPolling();
   }, [stopListPolling]);
 
   const onPresencePayload = useCallback((payload: unknown) => {
@@ -277,11 +278,16 @@ function RealLiveVisitors() {
                 reconciledRef.current = true;
                 maybeStopListPolling();
               } else {
-                onDown();
+                // Keep other brand sockets; only poll while reconcile is unhealthy.
+                startListPolling();
               }
             })();
           },
-          onSubscriptionError: onDown,
+          onSubscriptionError: () => {
+            // One brand auth failure must not drop healthy sibling subscriptions.
+            subscribedBrandIdsRef.current.delete(id);
+            startListPolling();
+          },
           onConnectionLost: onDown,
           subscriptionTimeoutMs: 10_000,
         });

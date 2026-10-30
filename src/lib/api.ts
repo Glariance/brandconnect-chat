@@ -1,10 +1,11 @@
 /** Credentialed API client for dashboard (Sanctum cookies) and visitor Bearer auth. */
 
-const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env ?? {};
-const API_URL = (viteEnv["VITE_API_URL"] ?? "http://localhost:8000").replace(/\/$/, "");
+// Vite only inlines env vars referenced via static `import.meta.env.VITE_*` access.
+// Dynamic `import.meta.env["VITE_*"]` stays empty in the browser and silently disables Echo.
+const API_URL = String(import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
 export const isRealChatEnabled = () =>
-  String(viteEnv["VITE_REAL_CHAT"] ?? "true").toLowerCase() !== "false";
+  String(import.meta.env.VITE_REAL_CHAT ?? "true").toLowerCase() !== "false";
 
 export class ApiError extends Error {
   status: number;
@@ -141,9 +142,9 @@ export function resetCsrf(): void {
 
 export function reverbEnv() {
   return {
-    key: viteEnv["VITE_REVERB_APP_KEY"] ?? "",
-    host: viteEnv["VITE_REVERB_HOST"] ?? "localhost",
-    port: Number(viteEnv["VITE_REVERB_PORT"] ?? 8081),
-    scheme: viteEnv["VITE_REVERB_SCHEME"] ?? "http",
+    key: String(import.meta.env.VITE_REVERB_APP_KEY ?? ""),
+    host: String(import.meta.env.VITE_REVERB_HOST ?? "localhost"),
+    port: Number(import.meta.env.VITE_REVERB_PORT ?? 8081),
+    scheme: String(import.meta.env.VITE_REVERB_SCHEME ?? "http"),
   };
 }

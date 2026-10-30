@@ -277,20 +277,28 @@ function RealWidget() {
 
     if (forceNew) clearVisitorIdentity(pid);
 
-    const cfg = await fetchWidgetConfig(pid, { signal });
-    presenceDiagMark("config", cfg.public_id);
-    setConfig(cfg);
+    // Config is UI-only — do not block presence on it. Overlap with session issue/resume.
+    const configStarted = performance.now();
+    const cfgPromise = fetchWidgetConfig(pid, { signal }).then((cfg) => {
+      presenceDiagMark("config", `${cfg.public_id} · ${Math.round(performance.now() - configStarted)}ms`);
+      setConfig(cfg);
+      return cfg;
+    });
 
     // Eager visitor identity for presence — no conversation until first message / chat start.
     let sessionToken = forceNew ? null : storage.getItem(SESSION_KEY(pid));
     let issuedNew = false;
+    const sessionStarted = performance.now();
     if (!sessionToken) {
       const session = await createVisitorSession(pid, { signal });
       sessionToken = session.token;
       storage.setItem(SESSION_KEY(pid), sessionToken);
       issuedNew = true;
     }
-    presenceDiagMark("session", issuedNew ? "issued" : "storage");
+    presenceDiagMark(
+      "session",
+      `${issuedNew ? "issued" : "storage"} · ${Math.round(performance.now() - sessionStarted)}ms`,
+    );
     setToken(sessionToken);
     setPagePath(sanitizePagePath(currentPage));
     presenceAuthRenewRef.current = false;
@@ -305,10 +313,13 @@ function RealWidget() {
       chatOpened: chatOpenedRef.current,
       hostVisible: hostVisibleRef.current,
       getToken: () => tokenRef.current,
-      onSuccess: ({ initial }) => {
+      onSuccess: ({ initial, durationMs }) => {
         setPresenceError(null);
         setPresenceRegistered(true);
-        presenceDiagMark("presence_ok", initial ? "initial" : "heartbeat");
+        presenceDiagMark(
+          "presence_ok",
+          `${initial ? "initial" : "heartbeat"} · ${durationMs}ms`,
+        );
       },
       onError: (failure) => {
         void onPresenceFailure(failure);
@@ -320,6 +331,15 @@ function RealWidget() {
     setMsgs([]);
     setOlderCursor(null);
     syncWatermarkRef.current.reset(undefined);
+
+    // Surface config failures after presence has already started.
+    try {
+      await cfgPromise;
+    } catch (e) {
+      presenceRef.current?.stop();
+      presenceRef.current = null;
+      throw e;
+    }
 
     return { token: sessionToken, conversationId: null as string | null };
   }, [clearVisitorIdentity, onPresenceFailure]);

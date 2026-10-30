@@ -1,6 +1,12 @@
 /**
  * Local-development launcher for BrandConnect chat.
- * Starts API (8000), frontend (8080), Reverb (8081), and a queue worker together.
+ * Starts API (8000 via multi-worker proxy), frontend (8080), Reverb (8081),
+ * and a queue worker together.
+ *
+ * `php artisan serve` is single-threaded. Dashboard polling + widget bootstrap
+ * otherwise serialize (~1s+/request). This launcher runs several artisan serve
+ * workers behind a tiny Node reverse proxy on :8000 so concurrent requests
+ * (config/session/presence + Live Visitors) can proceed in parallel.
  *
  * Usage: npm run dev:all
  * Override PHP: set PHP_BINARY to an absolute php.exe path (not committed).
@@ -26,6 +32,9 @@ const PORTS = {
   frontend: 8080,
   reverb: 8081,
 };
+
+/** Backend workers proxied to PORTS.api (artisan serve is single-threaded). */
+const API_WORKER_PORTS = [8011, 8012, 8013];
 
 const READY_TIMEOUT_MS = 60_000;
 const READY_POLL_MS = 400;
@@ -214,7 +223,10 @@ function preflight(phpBin) {
     fail("api/.env missing. Copy api/.env.example to api/.env and configure the database/Reverb (not done by this launcher).");
   }
 
-  assertPortFree(PORTS.api, "Laravel API");
+  assertPortFree(PORTS.api, "Laravel API proxy");
+  for (const port of API_WORKER_PORTS) {
+    assertPortFree(port, `Laravel API worker :${port}`);
+  }
   assertPortFree(PORTS.frontend, "Vite frontend");
   assertPortFree(PORTS.reverb, "Laravel Reverb");
 }
@@ -430,12 +442,36 @@ async function main() {
   process.on("SIGHUP", () => onSignal("SIGHUP"));
 
   try {
+    // Concurrent API workers: each artisan serve handles one request at a time.
+    const workerTargets = [];
+    for (const port of API_WORKER_PORTS) {
+      startProcess(
+        `API-${port}`,
+        `API-${port}`,
+        phpBin,
+        ["artisan", "serve", "--host=127.0.0.1", `--port=${port}`],
+        API_DIR,
+      );
+      workerTargets.push(`127.0.0.1:${port}`);
+    }
+
+    const proxyEntry = path.join(ROOT, "scripts", "dev-api-proxy.mjs");
+    if (!fs.existsSync(proxyEntry)) {
+      fail("scripts/dev-api-proxy.mjs not found.");
+    }
     startProcess(
-      "API",
-      "API",
-      phpBin,
-      ["artisan", "serve", "--host=127.0.0.1", `--port=${PORTS.api}`],
-      API_DIR,
+      "API-PROXY",
+      "API-PROXY",
+      process.execPath,
+      [proxyEntry],
+      ROOT,
+      {
+        env: {
+          API_PROXY_HOST: "127.0.0.1",
+          API_PROXY_PORT: String(PORTS.api),
+          API_WORKERS: workerTargets.join(","),
+        },
+      },
     );
 
     // Run Vite via Node (same as npm run dev) so the PID tree is killable on Windows
@@ -480,7 +516,16 @@ async function main() {
     }, 700);
     stopPoll.unref?.();
 
-    const apiOk = await waitUntil("API http://127.0.0.1:8000/up", () =>
+    // Wait for workers first, then the proxy — avoids false 502s during boot.
+    for (const port of API_WORKER_PORTS) {
+      const ok = await waitUntil(`API worker http://127.0.0.1:${port}/up`, () =>
+        httpReady(`http://127.0.0.1:${port}/up`),
+      );
+      if (!ok) {
+        fail(`API worker on :${port} failed readiness.`);
+      }
+    }
+    const apiOk = await waitUntil("API proxy http://127.0.0.1:8000/up", () =>
       httpReady("http://127.0.0.1:8000/up"),
     );
     const feOk = await waitUntil("FRONTEND http://127.0.0.1:8080/", () =>
@@ -510,7 +555,7 @@ async function main() {
     log("LAUNCHER", "");
     log("LAUNCHER", "=== Local stack ready (dev only) ===");
     log("LAUNCHER", "  Frontend:  http://127.0.0.1:8080/  (also http://localhost:8080/)");
-    log("LAUNCHER", "  API:       http://127.0.0.1:8000/");
+    log("LAUNCHER", "  API:       http://127.0.0.1:8000/  (proxy → " + workerTargets.join(", ") + ")");
     log("LAUNCHER", "  Health:    http://127.0.0.1:8000/up");
     log("LAUNCHER", "  Reverb:    ws://127.0.0.1:8081  (TCP accepted)");
     log("LAUNCHER", "  Queue:     worker running (--sleep=1 --tries=3)");

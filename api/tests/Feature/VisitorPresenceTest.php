@@ -57,7 +57,8 @@ class VisitorPresenceTest extends TestCase
             return $event->reason === VisitorPresenceUpdated::REASON_APPEARED
                 && $event->brandId === (int) $visitor->brand_id
                 && $event->broadcastAs() === 'presence.updated'
-                && $event->broadcastOn()[0]->name === 'private-brands.'.$visitor->brand_id.'.presence';
+                && $event->broadcastOn()[0]->name === 'private-brands.'.$visitor->brand_id.'.presence'
+                && $event instanceof \Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
         });
     }
 
