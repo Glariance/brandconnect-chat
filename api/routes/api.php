@@ -31,6 +31,7 @@ Route::prefix('v1')->middleware(EnsureFrontendRequestsAreStateful::class)->group
 
         Route::get('brands', [BrandController::class, 'index'])->name('api.v1.brands.index');
         Route::post('brands', [BrandController::class, 'store'])->name('api.v1.brands.store');
+        Route::patch('brands/{brand}', [BrandController::class, 'update'])->name('api.v1.brands.update');
 
         Route::get('live-visitors', [LiveVisitorController::class, 'index'])->name('api.v1.live-visitors.index');
 

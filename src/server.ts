@@ -2,6 +2,11 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+import {
+  dashboardFrameHeaders,
+  resolveWidgetFrameAncestors,
+  widgetEmbedResponseHeaders,
+} from "./lib/widget-frame-headers";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
@@ -44,12 +49,44 @@ function isH3SwallowedErrorBody(body: string): boolean {
   }
 }
 
+function withHeaders(response: Response, extra: HeadersInit): Response {
+  const headers = new Headers(response.headers);
+  const entries = extra instanceof Headers ? extra.entries() : Object.entries(extra);
+  for (const [key, value] of entries) {
+    if (value != null) headers.set(key, String(value));
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/**
+ * Enforce brand-specific CSP frame-ancestors on the /widget HTML response.
+ * Dashboard HTML fails closed (not embeddable). Do not use CSP meta tags.
+ */
+async function applyFrameAncestors(request: Request, response: Response): Promise<Response> {
+  const url = new URL(request.url);
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/html")) return response;
+
+  if (url.pathname === "/widget" || url.pathname.startsWith("/widget/")) {
+    const brand = url.searchParams.get("brand") ?? "";
+    const ancestors = await resolveWidgetFrameAncestors(brand);
+    return withHeaders(response, widgetEmbedResponseHeaders(ancestors));
+  }
+
+  return withHeaders(response, dashboardFrameHeaders());
+}
+
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
-      return await normalizeCatastrophicSsrResponse(response);
+      const normalized = await normalizeCatastrophicSsrResponse(response);
+      return await applyFrameAncestors(request, normalized);
     } catch (error) {
       console.error(error);
       return new Response(renderErrorPage(), {

@@ -63,7 +63,7 @@ class VisitorPresenceService
             : VisitorPresenceUpdated::REASON_UPDATED;
 
         if ($summary !== []) {
-            VisitorPresenceUpdated::dispatch(
+            $this->broadcastPresence(
                 (int) $visitor->brand_id,
                 $summary,
                 $reason,
@@ -183,11 +183,26 @@ class VisitorPresenceService
                 continue;
             }
 
-            VisitorPresenceUpdated::dispatch(
+            $this->broadcastPresence(
                 $brandId,
                 $this->summarizeTabs(collect([$last]), $now, forceOffline: true),
                 VisitorPresenceUpdated::REASON_OFFLINE,
             );
+        }
+    }
+
+    /**
+     * Presence uses ShouldBroadcastNow for low latency. If Reverb is down the
+     * heartbeat must still succeed — log and continue (dashboard HTTP fallback).
+     *
+     * @param  array<string, mixed>  $summary
+     */
+    protected function broadcastPresence(int $brandId, array $summary, string $reason): void
+    {
+        try {
+            VisitorPresenceUpdated::dispatch($brandId, $summary, $reason);
+        } catch (\Throwable $e) {
+            report($e);
         }
     }
 

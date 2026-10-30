@@ -5,7 +5,6 @@ namespace App\Events;
 use Illuminate\Broadcasting\InteractsWithSockets;
 use Illuminate\Broadcasting\PrivateChannel;
 use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
-use Illuminate\Contracts\Events\ShouldDispatchAfterCommit;
 use Illuminate\Foundation\Events\Dispatchable;
 use Illuminate\Queue\SerializesModels;
 
@@ -14,8 +13,10 @@ use Illuminate\Queue\SerializesModels;
  *
  * Broadcast synchronously (ShouldBroadcastNow) so Live Visitors is not delayed
  * by the queue worker sleep interval used for chat message fan-out.
+ * Not ShouldDispatchAfterCommit: the heartbeat row is already persisted before
+ * dispatch, and wrapping dispatch lets us catch Reverb failures without HTTP 500.
  */
-class VisitorPresenceUpdated implements ShouldBroadcastNow, ShouldDispatchAfterCommit
+class VisitorPresenceUpdated implements ShouldBroadcastNow
 {
     use Dispatchable, InteractsWithSockets, SerializesModels;
 

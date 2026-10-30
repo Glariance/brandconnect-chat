@@ -102,6 +102,11 @@ class BrandTest extends TestCase
             'allowed_origins' => ['https://shop.example.com'],
         ]);
 
+        config([
+            'widget.preview_origins' => ['http://localhost:8080'],
+            'widget.allow_localhost_origins' => false,
+        ]);
+
         $response = $this->getJson("/api/v1/widget/brands/{$brand->public_id}/config")
             ->assertOk()
             ->assertExactJson(['data' => [
@@ -110,6 +115,10 @@ class BrandTest extends TestCase
                 'color' => $brand->color,
                 'greeting' => 'Hello there',
                 'allowed_origins' => ['https://shop.example.com'],
+                'frame_ancestors' => [
+                    'https://shop.example.com',
+                    'http://localhost:8080',
+                ],
             ]]);
 
         $this->assertArrayNotHasKey('organization_id', $response->json('data'));

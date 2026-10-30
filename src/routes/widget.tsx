@@ -30,6 +30,7 @@ import { isVisitorAuthExpired, latestServerId, mergeMessages, PendingSendRegistr
 import { createSafeStorage, storagePersistenceNotice, type SafeStorage } from "@/lib/safe-storage";
 import { startVisitorPresence, type PresenceController, type PresenceFailure } from "@/lib/visitor-presence";
 import { sanitizePagePath } from "@/lib/presence-utils";
+import { originAllowed } from "@/lib/origin-allowlist";
 import {
   presenceDiagEnabled,
   presenceDiagMark,
@@ -190,6 +191,8 @@ function RealWidget() {
   const pollStopRef = useRef<(() => void) | null>(null);
   const presenceRef = useRef<PresenceController | null>(null);
   const parentOriginRef = useRef<string | null>(null);
+  /** null until widget config loads — then exact approved parent origins. */
+  const parentAllowlistRef = useRef<string[] | null>(null);
   const chatOpenedRef = useRef(false);
   const hostVisibleRef = useRef(true);
   const lastHostPageRef = useRef<string | null>(null);
@@ -281,6 +284,9 @@ function RealWidget() {
     const configStarted = performance.now();
     const cfgPromise = fetchWidgetConfig(pid, { signal }).then((cfg) => {
       presenceDiagMark("config", `${cfg.public_id} · ${Math.round(performance.now() - configStarted)}ms`);
+      parentAllowlistRef.current = Array.isArray(cfg.frame_ancestors)
+        ? cfg.frame_ancestors
+        : (cfg.allowed_origins ?? []);
       setConfig(cfg);
       return cfg;
     });
@@ -471,9 +477,7 @@ function RealWidget() {
     presenceDiagMark("listener_ready");
 
     const applyHostState = (data: Record<string, unknown>) => {
-      if (typeof data["parentOrigin"] === "string") {
-        parentOriginRef.current = data["parentOrigin"];
-      }
+      // Parent origin comes from event.origin only — never from message payload.
       if (typeof data["page"] === "string") {
         const next = sanitizePagePath(data["page"]);
         lastHostPageRef.current = next;
@@ -506,14 +510,17 @@ function RealWidget() {
       if ((data as { source?: string }).source !== "brandconnect-loader") return;
       // Only accept messages from the embedding parent window.
       if (e.source !== window.parent) return;
-      if (parentOriginRef.current && e.origin !== parentOriginRef.current) return;
-      if (!parentOriginRef.current) parentOriginRef.current = e.origin;
+      const allowlist = parentAllowlistRef.current;
+      if (allowlist) {
+        if (!originAllowed(allowlist, e.origin)) return;
+      } else if (parentOriginRef.current && e.origin !== parentOriginRef.current) {
+        return;
+      }
+      parentOriginRef.current = e.origin;
 
       const type = (data as { type?: string }).type;
       if (type === "bc:parent-origin") {
-        if (typeof (data as { parentOrigin?: string }).parentOrigin === "string") {
-          parentOriginRef.current = (data as { parentOrigin: string }).parentOrigin;
-        }
+        // Origin already bound to e.origin; ignore spoofable payload fields.
         return;
       }
       if (type === "bc:host-state") {

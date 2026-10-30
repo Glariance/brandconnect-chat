@@ -131,8 +131,12 @@ DB_USERNAME=root
 DB_PASSWORD=
 
 FRONTEND_URL=http://localhost:8080
+# BrandConnect SPA origins only (dashboard + widget iframe host) — not customer parent sites.
 CORS_ALLOWED_ORIGINS=http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173
 SANCTUM_STATEFUL_DOMAINS=localhost:8080,127.0.0.1:8080,localhost:3000,127.0.0.1:3000,localhost:5173,127.0.0.1:5173,localhost:8000,127.0.0.1:8000
+WIDGET_PREVIEW_ORIGINS=http://localhost:8080,http://127.0.0.1:8080
+WIDGET_ALLOW_LOCALHOST_ORIGINS=false
+REVERB_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS}"
 
 QUEUE_CONNECTION=database
 CACHE_STORE=database
@@ -228,7 +232,24 @@ The widget wraps `sessionStorage` in a safe adapter. If storage is blocked, cred
 5. Reply as the agent; refresh both sides — messages should persist (API is source of truth).
 6. A second visitor session must not see the first conversation.
 
-Still explicitly pending until performed: two-browser exchange, second-origin embed with third-party storage blocked, and production `frame-ancestors` verification.
+Still explicitly pending until performed: two-browser exchange on separate machines, third-party storage-blocked embed on a real customer domain, and production CDN/proxy confirmation that `Content-Security-Policy` / `Cache-Control` on `/widget` are not stripped.
+
+## Widget embedding (approved origins)
+
+| Layer | Role |
+|-------|------|
+| `public/widget.js` | Classic script tag on the customer site (no CORS needed for `<script src>`). Served from the BrandConnect frontend origin. |
+| `/widget?brand=` HTML | Iframe document. TanStack `src/server.ts` sets **`Content-Security-Policy: frame-ancestors …`** from that brand’s `allowed_origins` + `WIDGET_PREVIEW_ORIGINS`, plus **`Cache-Control: private, no-store`**. Missing/invalid brands → `frame-ancestors 'none'`. |
+| Dashboard HTML | `frame-ancestors 'none'` (not embeddable). |
+| API CORS | `CORS_ALLOWED_ORIGINS` = BrandConnect SPA hosts (iframe + dashboard). Customer parent origins are **not** required for API CORS because XHR runs inside the iframe. |
+| Reverb | `REVERB_ALLOWED_ORIGINS` = same SPA hosts (Echo connects from the iframe/dashboard, not the parent page). |
+| `postMessage` | Loader ↔ iframe: `event.source` checks + approved parent origin after config load. Not authentication. |
+
+Owners/admins manage brand origins on **Brands** (exact `scheme://host[:port]`; www ≠ apex; no wildcards/paths/credentials). Set `WIDGET_ALLOW_LOCALHOST_ORIGINS=true` only for local brand-origin experiments with `http://localhost`.
+
+### Production proxy notes
+
+Ensure the edge proxy forwards `/widget` to the TanStack app **without** replacing CSP. Prefer appending security headers only on non-widget routes, or merge carefully so brand-specific `frame-ancestors` is preserved. Do not cache `/widget` HTML across brands (`Vary` / `Cache-Control: private, no-store` already set by the app).
 
 ## Tests
 

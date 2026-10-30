@@ -8,6 +8,9 @@ export type ApiBrand = {
   timezone: string | null;
   color: string;
   public_id: string;
+  organization_id?: number;
+  allowed_origins?: string[];
+  greeting?: string | null;
 };
 
 export type ApiConversation = {
@@ -38,6 +41,8 @@ export type WidgetConfig = {
   color: string;
   greeting: string | null;
   allowed_origins: string[];
+  /** Exact origins allowed to embed this widget (brand allowlist + preview). */
+  frame_ancestors?: string[];
 };
 
 export type VisitorSession = {
@@ -106,8 +111,23 @@ export async function createBrand(input: {
   domain?: string;
   timezone?: string;
   color?: string;
+  allowed_origins?: string[];
 }): Promise<ApiBrand> {
   return unwrapOne(await api("/brands", { method: "POST", body: input }));
+}
+
+export async function updateBrand(
+  brandId: number,
+  input: {
+    name?: string;
+    domain?: string | null;
+    timezone?: string | null;
+    color?: string;
+    greeting?: string | null;
+    allowed_origins?: string[];
+  },
+): Promise<ApiBrand> {
+  return unwrapOne(await api(`/brands/${brandId}`, { method: "PATCH", body: input }));
 }
 
 export async function fetchConversations(
